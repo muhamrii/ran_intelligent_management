@@ -206,17 +206,24 @@ class RANNeo4jIntegrator:
         return relationships
     
     def discover_pattern_matches(self, dataframes_dict: Dict[str, pd.DataFrame]) -> List[Dict]:
-        """Discover PATTERN_MATCH relationships based on data patterns"""
+        """Discover PATTERN_MATCH relationships based on RAN-specific data patterns"""
         relationships = []
         
-        # Define common patterns
+        # Define RAN-specific patterns based on the context document
         patterns = {
-            'id_field': r'.*id$|.*_id$|^id.*',
-            'timestamp': r'.*time.*|.*date.*|.*_at$|.*_on$',
-            'status_field': r'.*status.*|.*state.*',
-            'name_field': r'.*name.*|.*_nm$',
-            'count_field': r'.*count.*|.*cnt.*|.*num.*',
-            'code_field': r'.*code.*|.*cd$'
+            'id_field': r'.*id$|.*_id$|^id.*|.*Id$|.*ID$',
+            'timestamp': r'.*time.*|.*Time.*|.*date.*|.*Date.*|.*_at$|.*_on$',
+            'status_field': r'.*status.*|.*Status.*|.*state.*|.*State.*',
+            'name_field': r'.*name.*|.*Name.*|.*_nm$',
+            'count_field': r'.*count.*|.*cnt.*|.*num.*|.*Number.*|.*NoOf.*|.*noOf.*',
+            'code_field': r'.*code.*|.*Code.*|.*cd$',
+            'enabled_flag': r'.*Enabled$|.*enabled$',
+            'threshold': r'.*Thres.*|.*Threshold.*|.*thres.*',
+            'reference': r'.*Ref$|.*ref$|.*Reference.*',
+            'power_related': r'.*power.*|.*Power.*|.*pwr.*',
+            'frequency_related': r'.*freq.*|.*Freq.*|.*frequency.*|.*Frequency.*',
+            'measurement': r'.*Meas.*|.*meas.*|.*measurement.*|.*Measurement.*',
+            'configuration': r'.*config.*|.*Config.*|.*setting.*|.*Setting.*|.*param.*|.*Param.*'
         }
         
         # Categorize columns by patterns
@@ -225,17 +232,16 @@ class RANNeo4jIntegrator:
         for table_name, df in dataframes_dict.items():
             for col in df.columns:
                 col_id = f"{table_name}.{col}"
-                col_lower = col.lower()
                 
                 for pattern_name, pattern_regex in patterns.items():
-                    if re.match(pattern_regex, col_lower):
+                    if re.match(pattern_regex, col, re.IGNORECASE):
                         pattern_columns[pattern_name].append({
                             'id': col_id,
                             'name': col,
                             'table': table_name,
                             'data_type': str(df[col].dtype)
                         })
-                        break
+                        break  # Only assign to first matching pattern
         
         # Create relationships between columns matching same patterns
         for pattern_name, columns in pattern_columns.items():
@@ -256,13 +262,17 @@ class RANNeo4jIntegrator:
                     if col1['data_type'] == col2['data_type']:
                         confidence = 0.9
                     
+                    # Special confidence adjustments for RAN-specific patterns
+                    if pattern_name in ['id_field', 'timestamp', 'status_field']:
+                        confidence += 0.05  # High confidence for critical patterns
+                    
                     relationships.append({
                         'type': 'PATTERN_MATCH',
                         'source': col1['id'],
                         'target': col2['id'],
                         'pattern_type': pattern_name,
                         'confidence': confidence,
-                        'pattern_description': f"Both fields follow {pattern_name} pattern"
+                        'pattern_description': f"Both fields follow {pattern_name} pattern in RAN context"
                     })
         
         return relationships
@@ -333,26 +343,26 @@ class RANNeo4jIntegrator:
         
         return relationships
 
-    def create_nodes_and_relationships(self, dataframes_dict: Dict[str, pd.DataFrame]):
-        """Create all nodes and relationships in Neo4j"""
-        
+    def create_table_nodes(self, dataframes_dict: Dict[str, pd.DataFrame]):
+        """Create table nodes in Neo4j"""
         with self.driver.session() as session:
-            # Create table nodes
             for table_name, df in dataframes_dict.items():
                 metadata = self.extract_table_metadata(df, table_name)
-                
-                # Create table node
                 session.run("""
                     MERGE (t:Table {name: $name})
                     SET t.row_count = $row_count,
                         t.column_count = $column_count,
                         t.created_at = $created_at
                 """, **metadata)
-                
-                # Create column nodes and relationships
+        print("✅ Table nodes created successfully.")
+
+    def create_column_nodes_and_relationships(self, dataframes_dict: Dict[str, pd.DataFrame]):
+        """Create column nodes and relationships in Neo4j"""
+        with self.driver.session() as session:
+            for table_name, df in dataframes_dict.items():
+                metadata = self.extract_table_metadata(df, table_name)
                 for col_name, col_metadata in metadata['columns'].items():
                     col_id = f"{table_name}.{col_name}"
-                    
                     session.run("""
                         MERGE (c:Column {id: $col_id})
                         SET c.name = $name,
@@ -368,17 +378,17 @@ class RANNeo4jIntegrator:
                     unique_count=col_metadata['unique_count'],
                     sample_values=col_metadata['sample_values']
                     )
-                    
-                    # Create relationship between table and column
                     session.run("""
                         MATCH (t:Table {name: $table_name})
                         MATCH (c:Column {id: $col_id})
                         MERGE (t)-[:HAS_COLUMN]->(c)
                     """, table_name=table_name, col_id=col_id)
-            
-            # Create semantic relationships with specific types
-            relationships = self.discover_semantic_relationships(dataframes_dict)
-            
+        print("✅ Column nodes and relationships created successfully.")
+
+    def create_semantic_relationships(self, dataframes_dict: Dict[str, pd.DataFrame]):
+        """Create semantic relationships in Neo4j"""
+        relationships = self.discover_semantic_relationships(dataframes_dict)
+        with self.driver.session() as session:
             for rel in relationships:
                 if rel['type'] == 'NAME_SIMILARITY':
                     session.run("""
@@ -389,7 +399,6 @@ class RANNeo4jIntegrator:
                             r.method = $method,
                             r.confidence = $confidence
                     """, **rel)
-                    
                 elif rel['type'] == 'VALUE_OVERLAP':
                     session.run("""
                         MATCH (c1:Column {id: $source})
@@ -400,7 +409,6 @@ class RANNeo4jIntegrator:
                             r.shared_values_count = $shared_values_count,
                             r.shared_sample_values = $shared_sample_values
                     """, **rel)
-                    
                 elif rel['type'] == 'PATTERN_MATCH':
                     session.run("""
                         MATCH (c1:Column {id: $source})
@@ -410,7 +418,6 @@ class RANNeo4jIntegrator:
                             r.confidence = $confidence,
                             r.pattern_description = $pattern_description
                     """, **rel)
-                    
                 elif rel['type'] == 'REFERENCES':
                     session.run("""
                         MATCH (c1:Column {id: $source})
@@ -420,12 +427,13 @@ class RANNeo4jIntegrator:
                             r.match_percentage = $match_percentage,
                             r.reference_type = $reference_type
                     """, **rel)
+        print("✅ Semantic relationships created successfully.")
             
-            # Generate conceptual groupings
-            self.generate_conceptual_groups()
+        # Generate conceptual groupings
+        self.generate_conceptual_groups()
 
     def generate_conceptual_groups(self, min_cluster_size: int = 3):
-        """Generate CONCEPTUAL_GROUP relationships based on clustering"""
+        """Generate CONCEPTUAL_GROUP relationships based on RAN-specific semantic concepts"""
         
         with self.driver.session() as session:
             # Get all columns with their embeddings
@@ -439,38 +447,26 @@ class RANNeo4jIntegrator:
             if len(columns) < min_cluster_size:
                 return
             
-            # Create embeddings for clustering
+            # Manual conceptual grouping based on RAN domain knowledge
+            concept_groups = self.create_ran_concept_groups(columns)
+            
+            # Also perform embedding-based clustering for additional insights
             column_names = [col[1] for col in columns]
             embeddings = self.create_embeddings(column_names)
             
             # Perform clustering
-            n_clusters = min(10, len(columns) // 3)  # Dynamic cluster count
+            n_clusters = min(10, len(columns) // 3)
             kmeans = KMeans(n_clusters=n_clusters, random_state=42)
             cluster_labels = kmeans.fit_predict(embeddings)
             
-            # Create CONCEPTUAL_GROUP relationships
-            for cluster_id in range(n_clusters):
-                cluster_columns = [columns[i] for i, label in enumerate(cluster_labels) if label == cluster_id]
-                
-                if len(cluster_columns) >= min_cluster_size:
-                    # Calculate cluster coherence (average similarity within cluster)
-                    cluster_indices = [i for i, label in enumerate(cluster_labels) if label == cluster_id]
-                    cluster_embeddings = embeddings[cluster_indices]
-                    
-                    if len(cluster_embeddings) > 1:
-                        cluster_similarity = cosine_similarity(cluster_embeddings).mean()
-                        confidence = float(cluster_similarity)
-                    else:
-                        confidence = 1.0
-                    
-                    # Determine semantic category based on common words
-                    semantic_category = self.determine_semantic_category([col[1] for col in cluster_columns])
-                    
-                    # Create relationships between all columns in the same cluster
-                    for i in range(len(cluster_columns)):
-                        for j in range(i + 1, len(cluster_columns)):
-                            col1_id, col1_name = cluster_columns[i]
-                            col2_id, col2_name = cluster_columns[j]
+            # Create manual concept relationships
+            for concept_name, concept_columns in concept_groups.items():
+                if len(concept_columns) >= min_cluster_size:
+                    # Create relationships between all columns in the same concept
+                    for i in range(len(concept_columns)):
+                        for j in range(i + 1, len(concept_columns)):
+                            col1_id = concept_columns[i]
+                            col2_id = concept_columns[j]
                             
                             # Skip if same table (conceptual groups are cross-table)
                             if col1_id.split('.')[0] == col2_id.split('.')[0]:
@@ -480,13 +476,58 @@ class RANNeo4jIntegrator:
                                 MATCH (c1:Column {id: $source})
                                 MATCH (c2:Column {id: $target})
                                 MERGE (c1)-[r:CONCEPTUAL_GROUP]-(c2)
-                                SET r.cluster_id = $cluster_id,
-                                    r.cluster_confidence = $confidence,
-                                    r.semantic_category = $semantic_category
+                                SET r.concept_name = $concept_name,
+                                    r.concept_confidence = $confidence,
+                                    r.semantic_category = $semantic_category,
+                                    r.grouping_method = 'domain_knowledge'
                             """, 
                             source=col1_id,
                             target=col2_id,
-                            cluster_id=f"cluster_{cluster_id}",
+                            concept_name=concept_name,
+                            confidence=0.95,  # High confidence for manual grouping
+                            semantic_category=concept_name
+                            )
+            
+            # Create embedding-based cluster relationships (for discovery)
+            for cluster_id in range(n_clusters):
+                cluster_columns = [columns[i] for i, label in enumerate(cluster_labels) if label == cluster_id]
+                
+                if len(cluster_columns) >= min_cluster_size:
+                    # Calculate cluster coherence
+                    cluster_indices = [i for i, label in enumerate(cluster_labels) if label == cluster_id]
+                    cluster_embeddings = embeddings[cluster_indices]
+                    
+                    if len(cluster_embeddings) > 1:
+                        cluster_similarity = cosine_similarity(cluster_embeddings).mean()
+                        confidence = float(cluster_similarity)
+                    else:
+                        confidence = 1.0
+                    
+                    # Determine semantic category
+                    semantic_category = self.determine_ran_semantic_category([col[1] for col in cluster_columns])
+                    
+                    # Create relationships for discovered clusters
+                    for i in range(len(cluster_columns)):
+                        for j in range(i + 1, len(cluster_columns)):
+                            col1_id, col1_name = cluster_columns[i]
+                            col2_id, col2_name = cluster_columns[j]
+                            
+                            # Skip if same table
+                            if col1_id.split('.')[0] == col2_id.split('.')[0]:
+                                continue
+                            
+                            session.run("""
+                                MATCH (c1:Column {id: $source})
+                                MATCH (c2:Column {id: $target})
+                                MERGE (c1)-[r:CONCEPTUAL_GROUP]-(c2)
+                                SET r.cluster_id = $cluster_id,
+                                    r.cluster_confidence = $confidence,
+                                    r.semantic_category = $semantic_category,
+                                    r.grouping_method = 'embedding_clustering'
+                            """, 
+                            source=col1_id,
+                            target=col2_id,
+                            cluster_id=f"embedding_cluster_{cluster_id}",
                             confidence=confidence,
                             semantic_category=semantic_category
                             )
@@ -515,6 +556,98 @@ class RANNeo4jIntegrator:
             return max(category_scores, key=category_scores.get)
         else:
             return 'general'
+
+    def create_ran_concept_groups(self, columns):
+        """Create RAN-specific conceptual groups based on domain knowledge"""
+        concept_groups = {}
+        
+        # RAN-specific concept groups with their characteristic patterns
+        ran_concepts = {
+            'performance_metrics': [
+                'throughput', 'latency', 'delay', 'jitter', 'loss', 'rate', 'mbps', 'gbps',
+                'utilization', 'efficiency', 'performance', 'kpi', 'metric', 'measurement'
+            ],
+            'power_management': [
+                'power', 'energy', 'watt', 'dbm', 'voltage', 'current', 'consumption',
+                'efficiency', 'green', 'savings', 'eco', 'battery'
+            ],
+            'frequency_spectrum': [
+                'frequency', 'freq', 'bandwidth', 'spectrum', 'channel', 'carrier',
+                'subcarrier', 'band', 'ghz', 'mhz', 'khz', 'hz', 'allocation'
+            ],
+            'network_topology': [
+                'node', 'cell', 'site', 'sector', 'antenna', 'tower', 'base_station',
+                'enode', 'gnodeb', 'location', 'position', 'coordinate', 'neighbor'
+            ],
+            'quality_metrics': [
+                'rsrp', 'rsrq', 'sinr', 'snr', 'bler', 'per', 'error_rate',
+                'quality', 'signal', 'interference', 'noise', 'cqi'
+            ],
+            'traffic_analysis': [
+                'traffic', 'volume', 'bytes', 'packets', 'session', 'connection',
+                'flow', 'data', 'usage', 'activity', 'load', 'congestion'
+            ],
+            'mobility_management': [
+                'handover', 'handoff', 'mobility', 'roaming', 'tracking',
+                'location_update', 'registration', 'attach', 'detach', 'movement'
+            ],
+            'configuration_parameters': [
+                'config', 'parameter', 'setting', 'threshold', 'limit', 'max',
+                'min', 'default', 'enabled', 'disabled', 'mode', 'policy'
+            ],
+            'security_features': [
+                'security', 'authentication', 'encryption', 'key', 'certificate',
+                'cipher', 'integrity', 'protection', 'access_control', 'firewall'
+            ],
+            'timing_synchronization': [
+                'timestamp', 'time', 'sync', 'clock', 'ptp', 'ntp', 'timing',
+                'schedule', 'frame', 'slot', 'symbol', 'period'
+            ]
+        }
+        
+        # Classify columns into concept groups
+        for col_id, col_name in columns:
+            col_name_lower = col_name.lower()
+            
+            for concept_name, keywords in ran_concepts.items():
+                for keyword in keywords:
+                    if keyword in col_name_lower:
+                        if concept_name not in concept_groups:
+                            concept_groups[concept_name] = []
+                        concept_groups[concept_name].append(col_id)
+                        break  # Only assign to first matching concept
+        
+        return concept_groups
+    
+    def determine_ran_semantic_category(self, column_names):
+        """Determine RAN-specific semantic category for a group of columns"""
+        name_text = ' '.join(column_names).lower()
+        
+        # RAN-specific category mappings
+        ran_categories = {
+            'performance': ['throughput', 'latency', 'performance', 'kpi', 'metric'],
+            'power': ['power', 'energy', 'dbm', 'watt', 'consumption'],
+            'frequency': ['frequency', 'spectrum', 'bandwidth', 'channel', 'carrier'],
+            'topology': ['node', 'cell', 'site', 'base_station', 'antenna'],
+            'quality': ['rsrp', 'rsrq', 'sinr', 'quality', 'signal'],
+            'traffic': ['traffic', 'volume', 'bytes', 'data', 'load'],
+            'mobility': ['handover', 'mobility', 'roaming', 'tracking'],
+            'configuration': ['config', 'parameter', 'setting', 'threshold'],
+            'security': ['security', 'authentication', 'encryption', 'key'],
+            'timing': ['timestamp', 'time', 'sync', 'clock', 'timing']
+        }
+        
+        # Count category matches
+        category_scores = {}
+        for category, keywords in ran_categories.items():
+            score = sum(1 for keyword in keywords if keyword in name_text)
+            if score > 0:
+                category_scores[category] = score
+        
+        if category_scores:
+            return max(category_scores, key=category_scores.get)
+        
+        return 'general'
 
     def close(self):
         """Close the Neo4j driver connection"""
