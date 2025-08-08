@@ -22,3 +22,4 @@ config.yaml
 
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
+ran_domain_model

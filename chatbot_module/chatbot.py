@@ -16,6 +16,7 @@ import hashlib
 import re
 import torch
 from datetime import datetime
+import os
 
 class OptimizedQueryInterface:
     """Performance-optimized query interface for large KG"""
@@ -79,12 +80,12 @@ class EnhancedRANEntityExtractor:
         # RAN-specific entity patterns
         self.ran_patterns = {
             'cell_id': r'cell[_\s]*id[_\s]*\d*',
-            'frequency': r'\d+\s*(mhz|ghz|khz)',
-            'power': r'\d+\s*(dbm|watts?|mw)',
+            'frequency': r'(?:\d+\s*(?:mhz|ghz|khz))|\bfreq\b|\bfrequency\b|band(?:width)?',
+            'power': r'(?:\d+\s*(?:dbm|watts?|mw))|\bpower\b|\bdbm\b',
             'coordinates': r'lat|lon|latitude|longitude|x_coord|y_coord',
             'timestamps': r'timestamp|time|date|created|updated',
             'identifiers': r'[a-z]+_id|id_[a-z]+|uuid|guid',
-            'measurements': r'rsrp|rsrq|sinr|throughput|latency|kpi|metric'
+            'measurements': r'rsrp|rsrq|sinr|throughput|latency|kpi|metric|cqi|bler'
         }
     
     def extract_technical_entities(self, query: str) -> Dict[str, List[str]]:
@@ -861,23 +862,61 @@ class RANChatbot:
 class EnhancedRANChatbot(RANChatbot):
     """Enhanced chatbot with optimizations and domain-specific capabilities"""
     
-    def __init__(self, neo4j_integrator, use_domain_model: bool = False):
+    def __init__(self, neo4j_integrator, use_domain_model: bool = False, model_dir: str | None = None):
         super().__init__(neo4j_integrator)
         
         # Enhanced components
         self.optimized_query = OptimizedQueryInterface(neo4j_integrator)
         self.entity_extractor = EnhancedRANEntityExtractor(neo4j_integrator)
         self.graph_traversal = IntelligentGraphTraversal(neo4j_integrator)
+        # Intent routing and synonyms to better guide retrieval
+        self.intent_domain_map = {
+            'performance_analysis': 'performance',
+            'power_optimization': 'power',
+            'spectrum_management': 'frequency',
+            'cell_configuration': 'configuration',
+            'quality_assessment': 'quality',
+            'traffic_analysis': 'traffic',
+            'fault_detection': 'security',  # map to security/fault domain
+            'capacity_planning': 'performance',
+            'interference_analysis': 'quality',
+            'handover_optimization': 'mobility',
+        }
+        self.query_synonyms = {
+            'power': ['power','dbm','energy','consumption','watts'],
+            'frequency': ['frequency','freq','band','bandwidth','carrier','channel'],
+            'performance': ['throughput','latency','kpi','utilization','efficiency','metric'],
+            'quality': ['rsrp','rsrq','sinr','quality','noise','interference','cqi','bler'],
+            'mobility': ['handover','handoff','roaming','x2','ng'],
+            'configuration': ['config','parameter','setting','threshold','cell','antenna','tilt'],
+            'traffic': ['traffic','volume','bytes','packets','usage','load','congestion']
+        }
         
         # Load domain-specific model if available
         self.domain_model = None
         self.domain_tokenizer = None
+        # Resolve model directory
+        self.model_dir = None
+        candidate_dirs = []
+        if model_dir:
+            candidate_dirs.append(model_dir)
+        # Relative to repository root and module folder
+        candidate_dirs.extend([
+            os.path.join(os.path.dirname(__file__), 'ran_domain_model'),
+            os.path.abspath(os.path.join(os.getcwd(), 'chatbot_module', 'ran_domain_model')),
+            os.path.abspath(os.path.join(os.getcwd(), 'ran_domain_model')),
+        ])
+        for d in candidate_dirs:
+            if d and os.path.isdir(d) and os.path.isfile(os.path.join(d, 'config.json')):
+                self.model_dir = d
+                break
         if use_domain_model:
             try:
                 # These imports will be available after fine-tuning
                 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-                self.domain_tokenizer = AutoTokenizer.from_pretrained("./ran_domain_model")
-                self.domain_model = AutoModelForSequenceClassification.from_pretrained("./ran_domain_model")
+                load_dir = self.model_dir or "./ran_domain_model"
+                self.domain_tokenizer = AutoTokenizer.from_pretrained(load_dir)
+                self.domain_model = AutoModelForSequenceClassification.from_pretrained(load_dir)
                 print("Domain-specific model loaded successfully")
             except Exception as e:
                 print(f"Domain-specific model not found: {e}")
@@ -885,15 +924,72 @@ class EnhancedRANChatbot(RANChatbot):
     
     def enhanced_process_query(self, user_query: str) -> Dict:
         """Enhanced query processing with optimizations"""
-        # Use domain model for intent detection if available
-        if self.domain_model:
-            intent = self._predict_intent_with_model(user_query)
-        else:
-            intent = self.detect_intent(user_query)
-        
+        # Use robust intent prediction API
+        intent, _ = self.predict_intent(user_query)
+
+        # 1) Route by predicted intent to domain insights (leverages fine-tuned labels)
+        if intent in self.intent_domain_map:
+            domain = self.intent_domain_map[intent]
+            try:
+                insights = self.query_interface.get_ran_domain_insights(domain)
+            except Exception as e:
+                insights = {'error': f'Domain query failed: {e}'}
+            if insights and ('error' in insights or insights.get('related_tables') or insights.get('domain_patterns')):
+                out = {
+                    'type': 'domain_inquiry',
+                    'query': user_query,
+                    'intent': intent,
+                    'domain': domain,
+                    'results': insights,
+                    'debug': {'path': 'intent->domain_inquiry'}
+                }
+                # Reuse base renderer
+                out['response'] = self.generate_response(out)
+                return out
+
+        # 1.5) Explicit table name search - if query contains clear table references
+        explicit_table = self._extract_table_name(user_query)
+        if explicit_table:
+            try:
+                # Try table details first
+                table_details = self.query_interface.get_table_details(explicit_table)
+                if table_details:
+                    return {
+                        'type': 'table_details',
+                        'query': user_query,
+                        'intent': intent,
+                        'table': explicit_table,
+                        'results': table_details,
+                        'response': self.generate_response({
+                            'type': 'table_details', 
+                            'table': explicit_table, 
+                            'results': table_details
+                        }),
+                        'debug': {'path': 'explicit_table_details', 'table': explicit_table}
+                    }
+                
+                # Try related tables if direct lookup fails
+                related = self.query_interface.find_related_tables(explicit_table)
+                if related:
+                    return {
+                        'type': 'related_tables',
+                        'query': user_query,
+                        'intent': intent,
+                        'table': explicit_table,
+                        'results': related,
+                        'response': self.generate_response({
+                            'type': 'related_tables',
+                            'table': explicit_table,
+                            'results': related
+                        }),
+                        'debug': {'path': 'explicit_table_relations', 'table': explicit_table}
+                    }
+            except Exception as e:
+                pass  # Continue to other methods
+
         # Enhanced entity extraction
         entities = self.entity_extractor.extract_technical_entities(user_query)
-        
+
         # Context-aware query generation
         if entities['measurements'] or entities['identifiers']:
             cypher_query, params = self.entity_extractor.contextualized_search(user_query, entities)
@@ -933,6 +1029,70 @@ class EnhancedRANChatbot(RANChatbot):
                 'response': self._format_clustering_response(results)
             }
         
+        # 2) Smarter semantic search with synonym expansion and tokenization
+        expanded_terms = self._expand_query_terms(user_query, intent)
+        tried = []
+        agg_results: List[Dict] = []
+        seen_tables = set()
+        
+        # Try each expanded term and aggregate unique results
+        for term in expanded_terms:
+            tried.append(term)
+            try:
+                r = self.optimized_query.optimized_semantic_search(term)
+            except Exception:
+                try:
+                    # Fallback to basic semantic search
+                    r = self.query_interface.semantic_search(term)
+                except Exception:
+                    r = []
+            
+            # Deduplicate by table_name and add relevance scoring
+            for item in r:
+                t = item.get('table_name')
+                if t and t not in seen_tables:
+                    # Add relevance boost if term matches table name closely
+                    if term.lower() in t.lower() or t.lower() in term.lower():
+                        item['relevance_boost'] = 2.0
+                    else:
+                        item['relevance_boost'] = 1.0
+                    agg_results.append(item)
+                    seen_tables.add(t)
+            if len(agg_results) >= 15:  # Increased limit for better coverage
+                break
+        
+        # Sort by relevance if we have results
+        if agg_results:
+            agg_results.sort(key=lambda x: (
+                x.get('relevance_boost', 1.0) * x.get('relevance_score', 1.0),
+                x.get('relationship_count', 0)
+            ), reverse=True)
+            
+            return {
+                'type': 'semantic_search',
+                'query': user_query,
+                'intent': intent,
+                'results': agg_results[:10],  # Top 10 most relevant
+                'response': self._format_optimized_response(agg_results[:10]),
+                'debug': {'path': 'expanded_semantic', 'tried': tried[:5], 'total_found': len(agg_results)}
+            }
+
+        # 3) Concept search fallback on tokens
+        for term in expanded_terms[:3]:
+            try:
+                r = self.query_interface.search_by_concept(term)
+            except Exception:
+                r = []
+            if r:
+                return {
+                    'type': 'concept_search',
+                    'query': user_query,
+                    'intent': intent,
+                    'results': r,
+                    'response': self.generate_response({'type': 'concept_search', 'results': r}),
+                    'debug': {'path': 'concept_fallback', 'term': term}
+                }
+
         # Fallback to original processing with optimization
         original_result = super().process_query(user_query)
         
@@ -941,44 +1101,126 @@ class EnhancedRANChatbot(RANChatbot):
             optimized_results = self.optimized_query.optimized_semantic_search(user_query)
             original_result['results'] = optimized_results
             original_result['response'] = self._format_optimized_response(optimized_results)
+            original_result['debug'] = {'path': 'base_semantic'}
         
         return original_result
     
-    def _predict_intent_with_model(self, query: str) -> str:
-        """Use domain-specific model for intent prediction"""
+    def _predict_intent_with_model(self, query: str) -> tuple[str, float | None]:
+        """Use domain-specific model for intent prediction. Returns (label, confidence)."""
         try:
+            if not (self.domain_model and self.domain_tokenizer):
+                return self.detect_intent(query), None
             inputs = self.domain_tokenizer(query, return_tensors="pt", truncation=True, padding=True)
-            
             with torch.no_grad():
                 outputs = self.domain_model(**inputs)
-                predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                predicted_class = torch.argmax(predictions, dim=-1).item()
-            
-            # Map to intent labels (these would come from the fine-tuning module)
-            intent_labels = ['performance_analysis', 'power_optimization', 'spectrum_management', 
-                           'cell_configuration', 'quality_assessment', 'traffic_analysis',
-                           'fault_detection', 'capacity_planning', 'interference_analysis', 'handover_optimization']
-            
-            return intent_labels[predicted_class] if predicted_class < len(intent_labels) else 'semantic_search'
+                probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
+                conf, predicted_class = torch.max(probs, dim=-1)
+            # Map to intent labels (from fine-tuned model)
+            intent_labels = [
+                'performance_analysis','power_optimization','spectrum_management','cell_configuration',
+                'quality_assessment','traffic_analysis','fault_detection','capacity_planning',
+                'interference_analysis','handover_optimization'
+            ]
+            label = intent_labels[predicted_class.item()] if predicted_class.item() < len(intent_labels) else 'semantic_search'
+            return label, float(conf.item())
         except Exception as e:
             print(f"Error in model prediction: {e}")
-            return self.detect_intent(query)
+            return self.detect_intent(query), None
+
+    def _keyword_intent_baseline(self, query: str) -> str:
+        """Lightweight keyword baseline that maps to fine-tuned intents without big models."""
+        q = query.lower()
+        rules = [
+            ('performance_analysis', ['throughput','latency','kpi','performance','utilization','efficiency']),
+            ('power_optimization', ['power','energy','dbm','consumption','efficiency','sleep']),
+            ('spectrum_management', ['frequency','spectrum','bandwidth','carrier','channel','band']),
+            ('cell_configuration', ['config','parameter','setting','threshold','cell','antenna','tilt']),
+            ('quality_assessment', ['rsrp','rsrq','sinr','quality','noise','interference','cqi','bler']),
+            ('traffic_analysis', ['traffic','volume','bytes','packets','usage','load','congestion']),
+            ('fault_detection', ['fault','error','alarm','failure','issue','alert']),
+            ('capacity_planning', ['capacity','headroom','forecast','plan','scaling','scale']),
+            ('interference_analysis', ['interference','overlap','neighbor','pci','collision','noise']),
+            ('handover_optimization', ['handover','handoff','mobility','roaming','x2','ng'])
+        ]
+        for label, kws in rules:
+            if any(k in q for k in kws):
+                return label
+        return 'performance_analysis'  # reasonable default for RAN
+
+    def predict_intent(self, query: str) -> tuple[str, float | None]:
+        """Public API: returns (intent_label, confidence_or_None).
+        Uses fine-tuned model if available, else falls back to keyword baseline.
+        """
+        if self.domain_model:
+            return self._predict_intent_with_model(query)
+        # baseline
+        label = self._keyword_intent_baseline(query)
+        return label, None
     
     def _extract_table_name(self, query: str) -> str:
-        """Extract table name from query using simple heuristics"""
-        words = query.split()
-        # Look for words that might be table names (simple heuristic)
-        for word in words:
-            if '_' in word and len(word) > 3:
-                return word
+        """Extract table name from query using improved heuristics.
+        Supports patterns like TableName.columnName and snake_case.
+        """
+        # Dotted pattern Table.column
+        m = re.search(r'([A-Za-z][A-Za-z0-9_]*)\.[A-Za-z][A-Za-z0-9_]*', query)
+        if m:
+            return m.group(1)
+        # Snake_case tokens
+        for tok in re.findall(r'[A-Za-z0-9_]+', query):
+            if '_' in tok and len(tok) > 3:
+                return tok
         return None
+
+    def _expand_query_terms(self, query: str, intent: str | None = None) -> List[str]:
+        """Build a list of search terms by expanding with synonyms and tokens."""
+        q = query.lower()
+        terms = set()
+        
+        # Add the original query
+        terms.add(query.strip())
+        
+        # Raw words (longer ones first)
+        words = re.findall(r'[a-z0-9_]+', q)
+        for w in words:
+            if len(w) > 2:
+                terms.add(w)
+        
+        # Extract table.column patterns
+        table_col_matches = re.findall(r'([A-Za-z][A-Za-z0-9_]*)\.[A-Za-z][A-Za-z0-9_]*', query)
+        for table_name in table_col_matches:
+            terms.add(table_name)
+        
+        # Extract camelCase/PascalCase words
+        camel_words = re.findall(r'[A-Z][a-z]+|[a-z]+[A-Z][a-z]*', query)
+        for word in camel_words:
+            terms.add(word.lower())
+        
+        # Intent-based synonyms
+        if intent in self.intent_domain_map:
+            dom = self.intent_domain_map[intent]
+            terms.add(dom)
+            for s in self.query_synonyms.get(dom, []):
+                terms.add(s)
+        
+        # Common domain synonyms if keywords present
+        for dom, syns in self.query_synonyms.items():
+            if any(syn in q for syn in syns):
+                terms.add(dom)
+                terms.update(syns)
+        
+        # Remove very short terms and sort by length (longer first)
+        filtered_terms = [t for t in terms if len(t) > 2]
+        ordered = sorted(filtered_terms, key=lambda x: (-len(x), x))
+        
+        # Cap list to avoid excessive queries but ensure we have enough variety
+        return ordered[:12]
     
     def _format_contextualized_response(self, results: List[Dict], entities: Dict) -> str:
         """Format response for contextualized search"""
         if not results:
             return "No relevant tables found for your technical query."
         
-        response = f"🔍 **Technical Search Results** (Found {len(results)} matches)\n\n"
+        response = f"🔍 Technical search results (found {len(results)} matches)\n\n"
         response += f"**Detected entities:**\n"
         for entity_type, values in entities.items():
             if values:
@@ -990,55 +1232,89 @@ class EnhancedRANChatbot(RANChatbot):
             response += f"• Matching columns: {', '.join(result.get('matching_columns', []))}\n"
             response += f"• Conceptual relationships: {result.get('conceptual_relationships', 0)}\n"
             response += f"• Row count: {result.get('row_count', 'N/A')}\n\n"
-        
-        return response
+        return self._humanize_response(response)
     
     def _format_relationship_response(self, results: List[Dict], table_name: str) -> str:
         """Format response for multi-hop relationships"""
         if not results:
             return f"No related tables found for {table_name}."
         
-        response = f"🔗 **Multi-hop Relationships for {table_name}**\n\n"
+        response = f"🔗 Multi-hop relationships for {table_name}\n\n"
         
         for result in results:
-            response += f"📋 **{result['related_table']}**\n"
+            response += f"📋 {result['related_table']}\n"
             response += f"• Relationship strength: {result.get('avg_relationship_strength', 0):.2f}\n"
             response += f"• Connection count: {result.get('connection_count', 0)}\n"
             response += f"• Shortest path: {result.get('shortest_path', 0)} hops\n"
             response += f"• Row count: {result.get('row_count', 'N/A')}\n\n"
-        
-        return response
+        return self._humanize_response(response)
     
     def _format_clustering_response(self, results: List[Dict]) -> str:
         """Format response for semantic clustering"""
         if not results:
             return "No semantic clusters found."
         
-        response = f"🎯 **Semantic Clusters** (Found {len(results)} clusters)\n\n"
+        response = f"🎯 Semantic clusters (found {len(results)} clusters)\n\n"
         
         for result in results:
-            response += f"🏷️ **{result['cluster_name']}**\n"
+            response += f"🏷️ {result['cluster_name']}\n"
             response += f"• Confidence: {result.get('avg_confidence', 0):.2f}\n"
             response += f"• Tables involved: {result.get('table_count', 0)}\n"
             response += f"• Sample tables: {', '.join(result.get('sample_tables', [])[:3])}\n"
             response += f"• Sample columns: {', '.join(result.get('sample_columns', [])[:5])}\n\n"
-        
-        return response
+        return self._humanize_response(response)
     
     def _format_optimized_response(self, results: List[Dict]) -> str:
         """Format response for optimized search results"""
         if not results:
             return "No results found."
         
-        response = f"⚡ **Optimized Search Results** (Found {len(results)} matches)\n\n"
+        response = f"⚡ Optimized search results (found {len(results)} matches)\n\n"
         
         for result in results:
-            response += f"📋 **{result['table_name']}** (Relevance: {result.get('relevance_score', 0):.1f})\n"
+            response += f"📋 {result['table_name']} (relevance: {result.get('relevance_score', 0):.1f})\n"
             response += f"• Top columns: {', '.join(result.get('top_columns', []))}\n"
             response += f"• Relationships: {result.get('relationship_count', 0)}\n"
             response += f"• Row count: {result.get('row_count', 'N/A')}\n"
             if result.get('sample_related_tables'):
                 response += f"• Related to: {', '.join(result['sample_related_tables'])}\n"
             response += "\n"
-        
-        return response
+        return self._humanize_response(response)
+
+    # --- Human-readable response enhancer (no big model) ---
+    def _humanize_response(self, text: str) -> str:
+        """Lightweight formatting for clearer, friendlier answers.
+        - Normalizes bullets
+        - Collapses excessive blank lines
+        - Ensures sentence case for headings
+        """
+        try:
+            lines = [l.rstrip() for l in text.splitlines()]
+            out = []
+            last_blank = False
+            for l in lines:
+                if not l.strip():
+                    if not last_blank:
+                        out.append("")
+                    last_blank = True
+                    continue
+                last_blank = False
+                # Normalize bullets
+                if l.strip().startswith(('- ', '* ', '• ')):
+                    l = '• ' + l.strip().lstrip('-*• ').strip()
+                # Clean heading markers
+                if l.startswith('📊') or l.startswith('🔍') or l.startswith('⚡') or l.startswith('🔗') or l.startswith('🎯') or l.startswith('📋'):
+                    # lowercase parenthetical phrases
+                    parts = l.split(' ', 1)
+                    if len(parts) == 2:
+                        tag, rest = parts
+                        if rest and rest[0].islower():
+                            rest = rest[:1].upper() + rest[1:]
+                        l = f"{tag} {rest}"
+                out.append(l)
+            # Limit trailing blanks
+            while out and not out[-1].strip():
+                out.pop()
+            return "\n".join(out)
+        except Exception:
+            return text
