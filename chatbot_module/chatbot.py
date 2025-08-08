@@ -11,7 +11,208 @@ from sklearn.metrics.pairwise import cosine_similarity
 from typing import Dict, List, Tuple, Any
 import logging
 import json
+import time
+import hashlib
+import re
+import torch
 from datetime import datetime
+
+class OptimizedQueryInterface:
+    """Performance-optimized query interface for large KG"""
+    
+    def __init__(self, neo4j_integrator):
+        self.integrator = neo4j_integrator
+        # Add query result caching
+        self.query_cache = {}
+        self.cache_ttl = 3600  # 1 hour
+        
+    def cached_query(self, query: str, params: dict = None):
+        """Execute query with caching"""
+        cache_key = hashlib.md5(f"{query}{str(params)}".encode()).hexdigest()
+        
+        if cache_key in self.query_cache:
+            cached_result, timestamp = self.query_cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                return cached_result
+        
+        with self.integrator.driver.session() as session:
+            result = session.run(query, params or {})
+            data = [dict(record) for record in result]
+            self.query_cache[cache_key] = (data, time.time())
+            return data
+    
+    def optimized_semantic_search(self, query: str, limit: int = 10) -> List[Dict]:
+        """Optimized search with pagination and indexing"""
+        search_query = """
+            MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+            WHERE toLower(t.name) CONTAINS toLower($search_query) 
+               OR toLower(c.name) CONTAINS toLower($search_query)
+            OPTIONAL MATCH (c)-[r]-(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+            WHERE type(r) IN ['NAME_SIMILARITY', 'VALUE_OVERLAP', 'PATTERN_MATCH', 'REFERENCES', 'CONCEPTUAL_GROUP']
+            WITH t, c, count(DISTINCT r) as relationship_count, 
+                 collect(DISTINCT type(r)) as relationship_types,
+                 collect(DISTINCT t2.name) as related_tables,
+                 CASE 
+                   WHEN toLower(t.name) CONTAINS toLower($search_query) THEN 2.0
+                   WHEN toLower(c.name) CONTAINS toLower($search_query) THEN 1.0
+                   ELSE 0.5
+                 END as relevance_score
+            RETURN t.name as table_name, 
+                   collect(DISTINCT c.name)[0..5] as top_columns,
+                   t.row_count as row_count,
+                   t.column_count as column_count,
+                   relationship_count,
+                   relationship_types,
+                   related_tables[0..3] as sample_related_tables,
+                   relevance_score
+            ORDER BY relevance_score DESC, relationship_count DESC, t.name
+            LIMIT $limit
+        """
+        return self.cached_query(search_query, {'search_query': query, 'limit': limit})
+
+class EnhancedRANEntityExtractor:
+    """Advanced entity extraction for RAN domain"""
+    
+    def __init__(self, neo4j_integrator):
+        self.integrator = neo4j_integrator
+        
+        # RAN-specific entity patterns
+        self.ran_patterns = {
+            'cell_id': r'cell[_\s]*id[_\s]*\d*',
+            'frequency': r'\d+\s*(mhz|ghz|khz)',
+            'power': r'\d+\s*(dbm|watts?|mw)',
+            'coordinates': r'lat|lon|latitude|longitude|x_coord|y_coord',
+            'timestamps': r'timestamp|time|date|created|updated',
+            'identifiers': r'[a-z]+_id|id_[a-z]+|uuid|guid',
+            'measurements': r'rsrp|rsrq|sinr|throughput|latency|kpi|metric'
+        }
+    
+    def extract_technical_entities(self, query: str) -> Dict[str, List[str]]:
+        """Extract RAN-specific technical entities"""
+        entities = {
+            'technical_terms': [],
+            'measurements': [],
+            'identifiers': [],
+            'temporal': [],
+            'spatial': []
+        }
+        
+        query_lower = query.lower()
+        
+        # Pattern-based extraction
+        for pattern_name, pattern in self.ran_patterns.items():
+            matches = re.findall(pattern, query_lower)
+            if matches:
+                if pattern_name in ['cell_id', 'identifiers']:
+                    entities['identifiers'].extend(matches)
+                elif pattern_name in ['frequency', 'power', 'measurements']:
+                    entities['measurements'].extend(matches)
+                elif pattern_name == 'timestamps':
+                    entities['temporal'].extend(matches)
+                elif pattern_name == 'coordinates':
+                    entities['spatial'].extend(matches)
+        
+        return entities
+    
+    def contextualized_search(self, query: str, entities: Dict) -> Tuple[str, Dict]:
+        """Generate contextualized Cypher query based on entities"""
+        base_query = """
+            MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+            WHERE 1=1
+        """
+        
+        conditions = []
+        params = {}
+        
+        if entities['measurements']:
+            conditions.append("any(term IN $measurements WHERE toLower(c.name) CONTAINS term)")
+            params['measurements'] = entities['measurements']
+        
+        if entities['identifiers']:
+            conditions.append("any(term IN $identifiers WHERE toLower(c.name) CONTAINS term)")
+            params['identifiers'] = entities['identifiers']
+        
+        if entities['temporal']:
+            conditions.append("any(term IN $temporal WHERE toLower(c.name) CONTAINS term)")
+            params['temporal'] = entities['temporal']
+        
+        if entities['spatial']:
+            conditions.append("any(term IN $spatial WHERE toLower(c.name) CONTAINS term)")
+            params['spatial'] = entities['spatial']
+        
+        if conditions:
+            base_query += " AND (" + " OR ".join(conditions) + ")"
+        
+        base_query += """
+            OPTIONAL MATCH (c)-[r:CONCEPTUAL_GROUP]-(c2:Column)
+            RETURN t.name as table_name,
+                   collect(DISTINCT c.name) as matching_columns,
+                   count(r) as conceptual_relationships,
+                   t.row_count as row_count
+            ORDER BY conceptual_relationships DESC, row_count DESC
+            LIMIT 10
+        """
+        
+        return base_query, params
+
+class IntelligentGraphTraversal:
+    """Optimized graph traversal for complex relationship queries"""
+    
+    def __init__(self, neo4j_integrator):
+        self.integrator = neo4j_integrator
+    
+    def multi_hop_relationships(self, table_name: str, max_hops: int = 3) -> List[Dict]:
+        """Find multi-hop relationships with path significance scoring"""
+        query = """
+            MATCH (t1:Table {name: $table_name})-[:HAS_COLUMN]->(c1:Column)
+            MATCH path = (c1)-[r*1..$max_hops]-(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+            WHERE t1 <> t2 AND all(rel IN r WHERE type(rel) IN ['CONCEPTUAL_GROUP', 'PATTERN_MATCH', 'NAME_SIMILARITY'])
+            WITH t2, path, 
+                 reduce(score = 0, rel IN r | 
+                   score + CASE type(rel)
+                     WHEN 'CONCEPTUAL_GROUP' THEN 1.0
+                     WHEN 'PATTERN_MATCH' THEN 0.8
+                     WHEN 'NAME_SIMILARITY' THEN 0.6
+                     ELSE 0.3 END
+                 ) as path_score,
+                 length(path) as path_length
+            RETURN t2.name as related_table,
+                   avg(path_score) as avg_relationship_strength,
+                   count(DISTINCT path) as connection_count,
+                   min(path_length) as shortest_path,
+                   t2.row_count as row_count
+            ORDER BY avg_relationship_strength DESC, connection_count DESC
+            LIMIT 15
+        """
+        
+        with self.integrator.driver.session() as session:
+            result = session.run(query, table_name=table_name, max_hops=max_hops)
+            return [dict(record) for record in result]
+    
+    def semantic_clustering(self, concept_threshold: float = 0.7) -> List[Dict]:
+        """Find semantic clusters in the knowledge graph"""
+        query = """
+            MATCH (c1:Column)-[r:CONCEPTUAL_GROUP]-(c2:Column)
+            WHERE r.confidence > $threshold
+            WITH r.semantic_category as cluster_name, 
+                 collect(DISTINCT c1.id) + collect(DISTINCT c2.id) as column_ids,
+                 avg(r.confidence) as avg_confidence
+            UNWIND column_ids as col_id
+            MATCH (c:Column {id: col_id})<-[:HAS_COLUMN]-(t:Table)
+            WITH cluster_name, avg_confidence, 
+                 collect(DISTINCT t.name) as tables,
+                 collect(DISTINCT c.name) as columns,
+                 count(DISTINCT t) as table_count
+            WHERE table_count >= 3
+            RETURN cluster_name, avg_confidence, tables[0..10] as sample_tables, 
+                   columns[0..15] as sample_columns, table_count
+            ORDER BY avg_confidence DESC, table_count DESC
+            LIMIT 20
+        """
+        
+        with self.integrator.driver.session() as session:
+            result = session.run(query, threshold=concept_threshold)
+            return [dict(record) for record in result]
 
 class RANNERGenerator:
     """Generate NER training data from Neo4j graph"""
@@ -656,3 +857,188 @@ class RANChatbot:
                 response += f"... and {len(results) - 5} more results\n"
             
             return response
+
+class EnhancedRANChatbot(RANChatbot):
+    """Enhanced chatbot with optimizations and domain-specific capabilities"""
+    
+    def __init__(self, neo4j_integrator, use_domain_model: bool = False):
+        super().__init__(neo4j_integrator)
+        
+        # Enhanced components
+        self.optimized_query = OptimizedQueryInterface(neo4j_integrator)
+        self.entity_extractor = EnhancedRANEntityExtractor(neo4j_integrator)
+        self.graph_traversal = IntelligentGraphTraversal(neo4j_integrator)
+        
+        # Load domain-specific model if available
+        self.domain_model = None
+        self.domain_tokenizer = None
+        if use_domain_model:
+            try:
+                # These imports will be available after fine-tuning
+                from transformers import AutoTokenizer, AutoModelForSequenceClassification
+                self.domain_tokenizer = AutoTokenizer.from_pretrained("./ran_domain_model")
+                self.domain_model = AutoModelForSequenceClassification.from_pretrained("./ran_domain_model")
+                print("Domain-specific model loaded successfully")
+            except Exception as e:
+                print(f"Domain-specific model not found: {e}")
+                print("Using default intent detection")
+    
+    def enhanced_process_query(self, user_query: str) -> Dict:
+        """Enhanced query processing with optimizations"""
+        # Use domain model for intent detection if available
+        if self.domain_model:
+            intent = self._predict_intent_with_model(user_query)
+        else:
+            intent = self.detect_intent(user_query)
+        
+        # Enhanced entity extraction
+        entities = self.entity_extractor.extract_technical_entities(user_query)
+        
+        # Context-aware query generation
+        if entities['measurements'] or entities['identifiers']:
+            cypher_query, params = self.entity_extractor.contextualized_search(user_query, entities)
+            results = self.optimized_query.cached_query(cypher_query, params)
+            
+            return {
+                'type': 'contextualized_search',
+                'query': user_query,
+                'intent': intent,
+                'entities': entities,
+                'results': results,
+                'response': self._format_contextualized_response(results, entities)
+            }
+        
+        # Multi-hop relationship analysis for complex queries
+        if 'related' in user_query.lower() or 'connected' in user_query.lower():
+            table_name = self._extract_table_name(user_query)
+            if table_name:
+                results = self.graph_traversal.multi_hop_relationships(table_name)
+                return {
+                    'type': 'multi_hop_relationships',
+                    'query': user_query,
+                    'intent': intent,
+                    'table': table_name,
+                    'results': results,
+                    'response': self._format_relationship_response(results, table_name)
+                }
+        
+        # Semantic clustering for concept queries
+        if intent == 'concept_search':
+            results = self.graph_traversal.semantic_clustering()
+            return {
+                'type': 'semantic_clustering',
+                'query': user_query,
+                'intent': intent,
+                'results': results,
+                'response': self._format_clustering_response(results)
+            }
+        
+        # Fallback to original processing with optimization
+        original_result = super().process_query(user_query)
+        
+        # Use optimized search if it's a semantic search
+        if original_result.get('type') == 'semantic_search':
+            optimized_results = self.optimized_query.optimized_semantic_search(user_query)
+            original_result['results'] = optimized_results
+            original_result['response'] = self._format_optimized_response(optimized_results)
+        
+        return original_result
+    
+    def _predict_intent_with_model(self, query: str) -> str:
+        """Use domain-specific model for intent prediction"""
+        try:
+            inputs = self.domain_tokenizer(query, return_tensors="pt", truncation=True, padding=True)
+            
+            with torch.no_grad():
+                outputs = self.domain_model(**inputs)
+                predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                predicted_class = torch.argmax(predictions, dim=-1).item()
+            
+            # Map to intent labels (these would come from the fine-tuning module)
+            intent_labels = ['performance_analysis', 'power_optimization', 'spectrum_management', 
+                           'cell_configuration', 'quality_assessment', 'traffic_analysis',
+                           'fault_detection', 'capacity_planning', 'interference_analysis', 'handover_optimization']
+            
+            return intent_labels[predicted_class] if predicted_class < len(intent_labels) else 'semantic_search'
+        except Exception as e:
+            print(f"Error in model prediction: {e}")
+            return self.detect_intent(query)
+    
+    def _extract_table_name(self, query: str) -> str:
+        """Extract table name from query using simple heuristics"""
+        words = query.split()
+        # Look for words that might be table names (simple heuristic)
+        for word in words:
+            if '_' in word and len(word) > 3:
+                return word
+        return None
+    
+    def _format_contextualized_response(self, results: List[Dict], entities: Dict) -> str:
+        """Format response for contextualized search"""
+        if not results:
+            return "No relevant tables found for your technical query."
+        
+        response = f"🔍 **Technical Search Results** (Found {len(results)} matches)\n\n"
+        response += f"**Detected entities:**\n"
+        for entity_type, values in entities.items():
+            if values:
+                response += f"• {entity_type.replace('_', ' ').title()}: {', '.join(values)}\n"
+        response += "\n"
+        
+        for result in results:
+            response += f"📋 **{result['table_name']}**\n"
+            response += f"• Matching columns: {', '.join(result.get('matching_columns', []))}\n"
+            response += f"• Conceptual relationships: {result.get('conceptual_relationships', 0)}\n"
+            response += f"• Row count: {result.get('row_count', 'N/A')}\n\n"
+        
+        return response
+    
+    def _format_relationship_response(self, results: List[Dict], table_name: str) -> str:
+        """Format response for multi-hop relationships"""
+        if not results:
+            return f"No related tables found for {table_name}."
+        
+        response = f"🔗 **Multi-hop Relationships for {table_name}**\n\n"
+        
+        for result in results:
+            response += f"📋 **{result['related_table']}**\n"
+            response += f"• Relationship strength: {result.get('avg_relationship_strength', 0):.2f}\n"
+            response += f"• Connection count: {result.get('connection_count', 0)}\n"
+            response += f"• Shortest path: {result.get('shortest_path', 0)} hops\n"
+            response += f"• Row count: {result.get('row_count', 'N/A')}\n\n"
+        
+        return response
+    
+    def _format_clustering_response(self, results: List[Dict]) -> str:
+        """Format response for semantic clustering"""
+        if not results:
+            return "No semantic clusters found."
+        
+        response = f"🎯 **Semantic Clusters** (Found {len(results)} clusters)\n\n"
+        
+        for result in results:
+            response += f"🏷️ **{result['cluster_name']}**\n"
+            response += f"• Confidence: {result.get('avg_confidence', 0):.2f}\n"
+            response += f"• Tables involved: {result.get('table_count', 0)}\n"
+            response += f"• Sample tables: {', '.join(result.get('sample_tables', [])[:3])}\n"
+            response += f"• Sample columns: {', '.join(result.get('sample_columns', [])[:5])}\n\n"
+        
+        return response
+    
+    def _format_optimized_response(self, results: List[Dict]) -> str:
+        """Format response for optimized search results"""
+        if not results:
+            return "No results found."
+        
+        response = f"⚡ **Optimized Search Results** (Found {len(results)} matches)\n\n"
+        
+        for result in results:
+            response += f"📋 **{result['table_name']}** (Relevance: {result.get('relevance_score', 0):.1f})\n"
+            response += f"• Top columns: {', '.join(result.get('top_columns', []))}\n"
+            response += f"• Relationships: {result.get('relationship_count', 0)}\n"
+            response += f"• Row count: {result.get('row_count', 'N/A')}\n"
+            if result.get('sample_related_tables'):
+                response += f"• Related to: {', '.join(result['sample_related_tables'])}\n"
+            response += "\n"
+        
+        return response
