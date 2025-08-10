@@ -34,15 +34,19 @@ Enhanced the RAN Intelligent Management Chatbot to improve query-table matching 
   - `bandwidth` and `band`
 - **Better Categorization**: Entities properly classified into measurements, identifiers, temporal, spatial
 
-### 4. Comprehensive Evaluation Framework
-- **Standard Model Comparison**: Added support for comparing against:
-  - DistilBERT
-  - BERT-base
-  - RoBERTa-base
-  - Sentence-Transformers models
-- **RAGAS Integration**: Local embedding-based evaluation without external APIs
-- **Multiple Metrics**: Token-F1, cosine similarity, accuracy, macro-F1
-- **Confusion Matrices**: Visual comparison across all models
+### 4. Academic Benchmarking Framework
+- **Information Retrieval (IR) Metrics**:
+  - Precision@K (K=1,3,5,10): Precision of top-K retrieved tables
+  - Recall@K: Coverage of relevant tables in top-K results
+  - Mean Average Precision (MAP): Overall ranking quality
+  - Mean Reciprocal Rank (MRR): Quality of first relevant result
+- **Natural Language Understanding (NLU) Metrics**:
+  - Semantic Similarity: Embedding-based answer quality
+  - Entity Precision/Recall/F1: Named entity extraction performance
+  - Intent Distribution Analysis: Understanding query categorization
+  - Response Quality Metrics: Structure and completeness
+- **Standard Model Comparison**: Compare against DistilBERT, BERT-base, RoBERTa-base
+- **Rich Visualizations**: Distribution plots, performance breakdowns, correlation analysis
 
 ### 5. Enhanced UI Features
 - **Debug Information**: Shows which retrieval path was used for each query
@@ -66,10 +70,10 @@ Concept Search → Fallback
 ```
 
 ### Evaluation Metrics
-- **Intent Accuracy**: How well models predict RAN domain intents
-- **Table Retrieval Success**: Percentage of queries returning relevant tables
-- **Response Quality**: Token-based and embedding-based similarity to ground truth
-- **Latency**: Query processing time distribution
+- **Intent Classification**: Accuracy, macro-F1 vs standard models
+- **Information Retrieval**: P@K, R@K, MAP, MRR for table retrieval
+- **Natural Language Understanding**: Semantic similarity, entity F1, response structure
+- **Academic Benchmarks**: Standard IR and NLU evaluation protocols
 
 ## Usage
 
@@ -80,11 +84,17 @@ Concept Search → Fallback
    - "Find frequency related patterns"
    - "What timing data exists?"
 
-### Evaluation
-1. Go to Research Lab tab
-2. Run Intent Evaluation with standard model comparison
-3. Run E2E Evaluation with RAGAS metrics
-4. Upload ground truth CSV for comparison
+### Academic Evaluation
+1. Go to Research Lab → End-to-end evaluation
+2. Run E2E evaluation on query set
+3. Upload IR ground truth CSV (query, relevant_tables)
+4. Upload NLU ground truth CSV (query, answer, entities) 
+5. Click "Run Academic Benchmarks"
+6. Review comprehensive IR and NLU metrics with visualizations
+
+**Sample ground truth files provided:**
+- `sample_ir_ground_truth.csv`: IR evaluation with relevant table lists
+- `sample_nlu_ground_truth.csv`: NLU evaluation with expected answers and entities
 
 ### Debug Information
 - Check "Path: {...}" caption under each response
@@ -95,11 +105,12 @@ Concept Search → Fallback
   - `concept_fallback`: Used concept search
 
 ## Dependencies
-- RAGAS (for evaluation)
 - Transformers (for standard models)
 - Sentence-Transformers (for embeddings)
 - Streamlit (for UI)
 - Neo4j (for knowledge graph)
+- Scikit-learn (for evaluation metrics)
+- Matplotlib/Seaborn (for visualizations)
 
 ## Performance Impact
 - Improved recall: ~30-40% more relevant results for domain queries

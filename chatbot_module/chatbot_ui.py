@@ -188,6 +188,8 @@ def handle_chat(query: str):
     latency = (time.time() - t0) * 1000
     response = result.get('response') or bot.generate_response(result)
     intent, conf = bot.predict_intent(query)
+    
+    # Enhanced metadata for parallel aggregated results
     meta = {
         'type': result.get('type'),
         'intent': intent,
@@ -199,9 +201,21 @@ def handle_chat(query: str):
         'latency_ms': round(latency, 1),
         'time': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
+    
+    # Add parallel processing metadata if available
+    if result.get('type') == 'parallel_aggregated':
+        meta.update({
+            'top_tables_count': len(result.get('top_tables', [])),
+            'top_columns_count': len(result.get('top_columns', [])),
+            'processing_time_ms': result.get('processing_time_ms', latency),
+            'processes_executed': len(result.get('parallel_results', {})),
+            'parallel_stats': result.get('debug', {}).get('processing_stats', {})
+        })
+    
     # Add gentle hint if empty/"No results"
     if not response or response.strip().lower() in {"no results found.", "no matching tables or columns found."}:
         response += "\n\nTip: Try adding a table or column hint (e.g., 'EUtranFrequency' or 'cell_config'), or a domain keyword like 'power' or 'frequency'."
+    
     st.session_state.chat.append({'q': query, 'a': response, 'meta': meta})
 
 
@@ -225,27 +239,71 @@ def chat_tab(example_prefill: str):
         with st.expander(("You: " + item['q'])[:80], expanded=(i==0)):
             st.markdown(item['a'])
             m = item['meta']
-            cols = st.columns(5)
-            with cols[0]:
-                st.caption(f"Intent: {m.get('intent')}")
-            with cols[1]:
-                c = m.get('confidence')
-                st.caption(f"Confidence: {c:.2f}" if isinstance(c,(int,float)) else "Confidence: -")
-            with cols[2]:
-                st.caption(f"Type: {m.get('type')}")
-            with cols[3]:
-                st.caption(f"Latency: {m.get('latency_ms')} ms")
-            with cols[4]:
-                st.caption(m.get('time'))
+            
+            # Enhanced display for parallel aggregated results
+            if m.get('type') == 'parallel_aggregated':
+                # Main metrics row
+                cols = st.columns(6)
+                with cols[0]:
+                    st.caption(f"Intent: {m.get('intent')}")
+                with cols[1]:
+                    c = m.get('confidence')
+                    st.caption(f"Confidence: {c:.2f}" if isinstance(c,(int,float)) else "Confidence: -")
+                with cols[2]:
+                    st.caption(f"Type: Parallel Aggregated")
+                with cols[3]:
+                    st.caption(f"Latency: {m.get('processing_time_ms', m.get('latency_ms'))} ms")
+                with cols[4]:
+                    st.caption(f"Tables: {m.get('top_tables_count', 0)}")
+                with cols[5]:
+                    st.caption(f"Columns: {m.get('top_columns_count', 0)}")
+                
+                # Processing statistics
+                if m.get('parallel_stats'):
+                    st.caption("**Processing Results:**")
+                    stats = m['parallel_stats']
+                    success_processes = [k for k, v in stats.items() if v == 'success']
+                    if success_processes:
+                        st.caption(f"✅ Successful: {', '.join(success_processes)}")
+                    
+                    error_processes = [k for k, v in stats.items() if 'error' in str(v)]
+                    if error_processes:
+                        st.caption(f"⚠️ Errors: {', '.join(error_processes)}")
+                
+            else:
+                # Standard display for other result types
+                cols = st.columns(5)
+                with cols[0]:
+                    st.caption(f"Intent: {m.get('intent')}")
+                with cols[1]:
+                    c = m.get('confidence')
+                    st.caption(f"Confidence: {c:.2f}" if isinstance(c,(int,float)) else "Confidence: -")
+                with cols[2]:
+                    st.caption(f"Type: {m.get('type')}")
+                with cols[3]:
+                    st.caption(f"Latency: {m.get('latency_ms')} ms")
+                with cols[4]:
+                    st.caption(m.get('time'))
+            
             # Debug path if available
             dbg = item.get('meta', {}).get('debug') or {}
-            if dbg:
-                st.caption(f"Path: {dbg}")
+            if dbg and dbg.get('path'):
+                st.caption(f"Path: {dbg.get('path')}")
+            
+            # Show additional debug info for parallel processing
+            if m.get('type') == 'parallel_aggregated' and dbg.get('processes_run'):
+                with st.expander("🔍 Detailed Processing Info", expanded=False):
+                    st.json({
+                        'processes_executed': dbg.get('processes_run', []),
+                        'processing_stats': m.get('parallel_stats', {}),
+                        'entities_extracted': bool(m.get('entities')),
+                        'domain_identified': bool(m.get('domain'))
+                    })
 
 
 def research_tab():
     st.subheader("🧪 Research Lab")
-    tabs = st.tabs(["Intent evaluation", "End-to-end evaluation", "Schema & exports"])
+    tabs = st.tabs(["Intent evaluation", "End-to-end evaluation", "Academic benchmarking", "Schema & exports"])
 
     # Intent evaluation
     with tabs[0]:
@@ -463,7 +521,24 @@ def research_tab():
                 def contexts_from_res(res: dict) -> list[str]:
                     ctx: list[str] = []
                     rtype = res.get('type')
-                    if rtype == 'semantic_search':
+                    
+                    # Handle new parallel aggregated results
+                    if rtype == 'parallel_aggregated':
+                        # Extract table names from top_tables
+                        for table_info in (res.get('top_tables') or [])[:10]:
+                            table_name = table_info.get('table_name')
+                            if table_name:
+                                sources = ', '.join(table_info.get('sources', [])[:3])
+                                ctx.append(f"Table {table_name} (sources: {sources})")
+                        
+                        # Extract columns from top_columns
+                        for col_info in (res.get('top_columns') or [])[:5]:
+                            col_name = col_info.get('column_name')
+                            tables = ', '.join(list(col_info.get('tables', []))[:2])
+                            if col_name and tables:
+                                ctx.append(f"Column {col_name} (in: {tables})")
+                    
+                    elif rtype == 'semantic_search':
                         for r in (res.get('results') or [])[:3]:
                             cols = r.get('columns') or r.get('top_columns') or []
                             ctx.append(f"Table {r.get('table_name')} cols: {', '.join(cols[:10])}")
@@ -487,6 +562,7 @@ def research_tab():
                     elif rtype == 'semantic_clustering':
                         for r in (res.get('results') or [])[:3]:
                             ctx.append(f"Cluster {r.get('cluster_name')} tables {', '.join((r.get('sample_tables') or [])[:5])}")
+                    
                     # Fallback: use generated response itself
                     if not ctx:
                         resp = res.get('response')
@@ -531,87 +607,425 @@ def research_tab():
                 st.dataframe(df.drop(columns=['contexts']) if 'contexts' in df else df, use_container_width=True)
                 st.download_button("Download CSV", df.to_csv(index=False), file_name="e2e_eval.csv", mime="text/csv")
 
-                st.markdown("---")
-                st.subheader("RAG-style evaluation (optional)")
-                st.caption("If you have ground-truth answers, you can compute embedding-only similarity metrics locally. RAGAS support is available without external APIs.")
-                gt_csv = st.file_uploader("Ground truth CSV (columns: query,answer)", type=["csv"], key="gt_csv")
-                if gt_csv is not None:
-                    try:
-                        gt_df = pd.read_csv(gt_csv).dropna(subset=['query','answer'])
-                        merged = df.merge(gt_df, how='left', on='query', suffixes=('', '_gt'))
-                        # Heuristic semantic similarity via simple token overlap as fallback
-                        def token_f1(a,b):
-                            ta = set(re.findall(r"[a-z0-9_]+", str(a).lower()))
-                            tb = set(re.findall(r"[a-z0-9_]+", str(b).lower()))
-                            if not ta or not tb:
-                                return 0.0
-                            tp = len(ta & tb)
-                            prec = tp/len(ta)
-                            rec = tp/len(tb)
-                            return 2*prec*rec/(prec+rec) if (prec+rec)>0 else 0.0
-                        merged['sim_token_f1'] = merged.apply(lambda r: token_f1(r.get('answer'), r.get('response', '')), axis=1)
-                        st.write(merged[['query','answer','response','sim_token_f1']].head(30))
-                        st.json({'Avg token-F1': float(merged['sim_token_f1'].mean())})
-                        st.download_button("Download RAG-style eval", merged.to_csv(index=False), file_name="rag_style_eval.csv", mime="text/csv")
-
-                        # RAGAS embedding-only evaluation (best-effort)
-                        st.markdown("#### RAGAS (embedding-only)")
-                        run_ragas = st.checkbox("Compute RAGAS embedding metrics (no external API)")
-                        if run_ragas:
-                            try:
-                                from datasets import Dataset
-                                # Build RAGAS dataset fields
-                                ragas_df = merged[['query','response','contexts','answer']].rename(columns={
-                                    'query':'question', 'response':'answer', 'answer':'ground_truth'
-                                })
-                                # Ensure lists for contexts
-                                ragas_df['contexts'] = ragas_df['contexts'].apply(lambda x: x if isinstance(x, list) else ([x] if pd.notna(x) else []))
-                                ds = Dataset.from_pandas(ragas_df)
-
-                                # Try to import RAGAS metrics that work with embeddings only
-                                metrics = []
-                                try:
-                                    from ragas.metrics import semantic_similarity
-                                    metrics.append(semantic_similarity())
-                                except Exception:
-                                    pass
-                                # Prepare local embeddings
-                                embedder = None
-                                try:
-                                    from ragas.embeddings import SentenceTransformerEmbeddings
-                                    model_name = st.text_input("Embedding model (HF)", value="sentence-transformers/all-MiniLM-L6-v2")
-                                    embedder = SentenceTransformerEmbeddings(model_name)
-                                except Exception as e:
-                                    st.warning(f"Embeddings backend unavailable: {e}")
-
-                                if metrics and embedder is not None:
-                                    from ragas import evaluate
-                                    ragas_res = evaluate(ds, metrics=metrics, embeddings=embedder)
-                                    st.write(ragas_res)
-                                else:
-                                    st.info("RAGAS semantic_similarity metric not available or embeddings backend failed. Falling back to local cosine similarity.")
-                                    # Local cosine similarity as fallback (uses sentence-transformers if available)
-                                    try:
-                                        from sentence_transformers import SentenceTransformer
-                                        smodel_name = st.text_input("Local ST model (fallback)", value="sentence-transformers/all-MiniLM-L6-v2", key="st_model_fallback")
-                                        st_model = SentenceTransformer(smodel_name)
-                                        ans_emb = st_model.encode(merged['response'].fillna('').tolist(), normalize_embeddings=True, show_progress_bar=False)
-                                        gt_emb = st_model.encode(merged['answer'].fillna('').tolist(), normalize_embeddings=True, show_progress_bar=False)
-                                        sims = (ans_emb * gt_emb).sum(axis=1)
-                                        merged['sim_cosine'] = sims
-                                        st.json({'Avg cosine': float(np.mean(sims))})
-                                        st.dataframe(merged[['query','answer','response','sim_token_f1','sim_cosine']].head(30))
-                                    except Exception as e:
-                                        st.error(f"Local embedding similarity failed: {e}")
-                            except Exception as e:
-                                st.error(f"RAGAS evaluation failed: {e}")
-                    except Exception as e:
-                        st.error(f"RAG-style eval failed: {e}")
             except Exception as e:
-                st.error(f"E2E failed: {e}")
+                st.error(f"Evaluation failed: {e}")
+
+    # Academic benchmarking (separate tab)
+    with tabs[2]:
+        st.caption("Comprehensive IR and NLU evaluation using standard academic metrics for richer insights.")
+        
+        # Load sample data paths
+        sample_ir_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'sample_ir_ground_truth.csv')
+        sample_nlu_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'sample_nlu_ground_truth.csv')
+        
+        # Check if sample files exist
+        has_sample_ir = os.path.exists(sample_ir_path)
+        has_sample_nlu = os.path.exists(sample_nlu_path)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Information Retrieval (IR) Evaluation")
+            use_sample_ir = st.checkbox("Use generated sample IR data", value=has_sample_ir, disabled=not has_sample_ir)
+            if not use_sample_ir:
+                ir_csv = st.file_uploader("IR Ground Truth CSV (columns: query,relevant_tables)", type=["csv"], key="ir_csv")
+            else:
+                ir_csv = sample_ir_path
+                if has_sample_ir:
+                    st.success("✅ Using generated sample IR data")
+                else:
+                    st.warning("Sample IR data not found - run data generation notebook first")
+        
+        with col2:
+            st.markdown("#### Natural Language Understanding (NLU) Evaluation")
+            use_sample_nlu = st.checkbox("Use generated sample NLU data", value=has_sample_nlu, disabled=not has_sample_nlu)
+            if not use_sample_nlu:
+                nlu_csv = st.file_uploader("NLU Ground Truth CSV (columns: query,answer,entities)", type=["csv"], key="nlu_csv")
+            else:
+                nlu_csv = sample_nlu_path
+                if has_sample_nlu:
+                    st.success("✅ Using generated sample NLU data")
+                else:
+                    st.warning("Sample NLU data not found - run data generation notebook first")
+        
+        if st.button("Run Academic Benchmarks", type="primary"):
+            benchmark_results = {}
+            
+            # === IR BENCHMARKS ===
+            if ir_csv is not None:
+                try:
+                    if isinstance(ir_csv, str):
+                        ir_df = pd.read_csv(ir_csv).dropna(subset=['query','relevant_tables'])
+                    else:
+                        ir_df = pd.read_csv(ir_csv).dropna(subset=['query','relevant_tables'])
+                    
+                    st.markdown("##### IR Benchmark Results")
+                    
+                    def parse_relevant_tables(tables_str):
+                        """Parse comma-separated table names"""
+                        if pd.isna(tables_str):
+                            return []
+                        return [t.strip() for t in str(tables_str).split(',') if t.strip()]
+                    
+                    def compute_ir_metrics(retrieved_tables, relevant_tables, k_values=[1,3,5,10]):
+                        """Compute IR metrics including MAP@K using ranked list order."""
+                        metrics = {}
+                        if not relevant_tables:
+                            base = {f'P@{k}':0.0 for k in k_values} | {f'R@{k}':0.0 for k in k_values}
+                            base.update({'MAP':0.0,'MRR':0.0})
+                            for k in k_values:
+                                base[f'MAP@{k}']=0.0
+                            return base
+                        relevant_set = set(relevant_tables)
+                        # Precision/Recall@K
+                        for k in k_values:
+                            seg = retrieved_tables[:k]
+                            if seg:
+                                rel_k = sum(1 for t in seg if t in relevant_set)
+                                metrics[f'P@{k}']= rel_k/len(seg)
+                                metrics[f'R@{k}']= rel_k/len(relevant_set)
+                            else:
+                                metrics[f'P@{k}']=0.0; metrics[f'R@{k}']=0.0
+                        # MAP full
+                        ap_sum=0.0; rel_found=0
+                        for i,t in enumerate(retrieved_tables,1):
+                            if t in relevant_set:
+                                rel_found+=1
+                                ap_sum += rel_found / i
+                        metrics['MAP']= ap_sum/len(relevant_set) if relevant_set else 0.0
+                        # MAP@K variants
+                        for k in k_values:
+                            ap_k=0.0; rel_k_found=0
+                            for i,t in enumerate(retrieved_tables[:k],1):
+                                if t in relevant_set:
+                                    rel_k_found+=1
+                                    ap_k += rel_k_found / i
+                            denom = min(len(relevant_set), k)
+                            metrics[f'MAP@{k}']= ap_k/denom if denom>0 else 0.0
+                        # MRR
+                        mrr=0.0
+                        for i,t in enumerate(retrieved_tables,1):
+                            if t in relevant_set:
+                                mrr = 1.0/i
+                                break
+                        metrics['MRR']=mrr
+                        return metrics
+                    
+                    # Process queries first
+                    if not st.session_state.connected:
+                        st.error("Please connect to Neo4j first")
+                        st.stop()
+                    
+                    bot = st.session_state.chatbot
+                    progress_bar = st.progress(0)
+                    
+                    # Process all queries to get contexts
+                    query_contexts = {}
+                    for i, query in enumerate(ir_df['query'].unique()):
+                        try:
+                            res = bot.enhanced_process_query(query)
+                        except AttributeError:
+                            res = bot.process_query(query)
+                        
+                        # Extract table names depending on result type
+                        contexts = []
+                        rtype = res.get('type')
+                        if rtype == 'parallel_aggregated':
+                            # Take ranked top tables directly
+                            for t in res.get('top_tables', [])[:15]:
+                                tname = t.get('table_name') if isinstance(t, dict) else None
+                                if tname:
+                                    contexts.append(tname)
+                            # Fallback to key_results domain tables if any
+                            dom_insights = res.get('key_results', {}).get('domain_insights', {})
+                            for t in dom_insights.get('related_tables', [])[:5]:
+                                tn = t.get('table_name')
+                                if tn:
+                                    contexts.append(tn)
+                        elif rtype == 'semantic_search':
+                            for r in (res.get('results') or [])[:10]:
+                                table_name = r.get('table_name')
+                                if table_name:
+                                    contexts.append(table_name)
+                        elif rtype == 'domain_inquiry':
+                            tables = (res.get('results') or {}).get('related_tables') or []
+                            for t in tables[:10]:
+                                table_name = t.get('table_name')
+                                if table_name:
+                                    contexts.append(table_name)
+                        elif rtype == 'table_details':
+                            d = res.get('results') or {}
+                            table_name = d.get('table_name')
+                            if table_name:
+                                contexts.append(table_name)
+                        elif rtype == 'concept_search':
+                            for r in (res.get('results') or [])[:10]:
+                                tnames = r.get('tables') or []
+                                contexts.extend(tnames[:5])
+                        query_contexts[query] = list(dict.fromkeys(contexts))  # preserve order, dedupe
+                        progress_bar.progress((i + 1) / len(ir_df['query'].unique()))
+                    
+                    # Compute IR metrics for each query
+                    ir_results = []
+                    for _, row in ir_df.iterrows():
+                        query = row['query']
+                        relevant_tables = parse_relevant_tables(row['relevant_tables'])
+                        retrieved_tables = query_contexts.get(query, [])
+                        
+                        metrics = compute_ir_metrics(retrieved_tables, relevant_tables)
+                        metrics['query'] = query
+                        metrics['relevant_count'] = len(relevant_tables)
+                        metrics['retrieved_count'] = len(retrieved_tables)
+                        ir_results.append(metrics)
+                    
+                    if ir_results:
+                        ir_results_df = pd.DataFrame(ir_results)
+                        
+                        # Aggregate metrics (include MAP@K)
+                        agg_metrics = {}
+                        metric_cols = [col for col in ir_results_df.columns if col not in ['query', 'relevant_count', 'retrieved_count']]
+                        for col in metric_cols:
+                            agg_metrics[f'Avg_{col}'] = ir_results_df[col].mean()
+                        
+                        st.json(agg_metrics)
+                        
+                        # Visualizations
+                        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+                        
+                        # Precision@K
+                        k_values = [1, 3, 5, 10]
+                        p_at_k = [agg_metrics.get(f'Avg_P@{k}', 0) for k in k_values]
+                        axes[0,0].bar(k_values, p_at_k, color='skyblue')
+                        axes[0,0].set_title('Precision@K')
+                        axes[0,0].set_xlabel('K')
+                        axes[0,0].set_ylabel('Precision')
+                        
+                        # Recall@K
+                        r_at_k = [agg_metrics.get(f'Avg_R@{k}', 0) for k in k_values]
+                        axes[0,1].bar(k_values, r_at_k, color='lightcoral')
+                        axes[0,1].set_title('Recall@K')
+                        axes[0,1].set_xlabel('K')
+                        axes[0,1].set_ylabel('Recall')
+                        
+                        # MAP and MRR comparison
+                        map_mrr = [agg_metrics.get('Avg_MAP', 0), agg_metrics.get('Avg_MRR', 0)]
+                        axes[1,0].bar(['MAP', 'MRR'], map_mrr, color=['lightgreen', 'orange'])
+                        axes[1,0].set_title('MAP vs MRR')
+                        axes[1,0].set_ylabel('Score')
+                        
+                        # Query-level performance distribution
+                        axes[1,1].hist(ir_results_df['MAP'], bins=10, alpha=0.7, color='purple')
+                        axes[1,1].set_title('MAP Score Distribution')
+                        axes[1,1].set_xlabel('MAP Score')
+                        axes[1,1].set_ylabel('Frequency')
+                        
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        
+                        st.dataframe(ir_results_df, use_container_width=True)
+                        benchmark_results['IR'] = agg_metrics
+                
+                except Exception as e:
+                    st.error(f"IR evaluation failed: {e}")
+            
+            # === NLU BENCHMARKS ===
+            if nlu_csv is not None:
+                try:
+                    if isinstance(nlu_csv, str):
+                        nlu_df = pd.read_csv(nlu_csv).dropna(subset=['query'])
+                    else:
+                        nlu_df = pd.read_csv(nlu_csv).dropna(subset=['query'])
+                    
+                    st.markdown("##### NLU Benchmark Results")
+                    
+                    def get_embedding_model():
+                        if 'embedding_model' not in st.session_state:
+                            from sentence_transformers import SentenceTransformer
+                            st.session_state.embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+                        return st.session_state.embedding_model
+                    def compute_semantic_similarity(text1, text2):
+                        try:
+                            model = get_embedding_model()
+                            emb = model.encode([str(text1), str(text2)])
+                            similarity = (emb[0] @ emb[1].T) / (np.linalg.norm(emb[0])*np.linalg.norm(emb[1])+1e-9)
+                            return float(similarity)
+                        except Exception:
+                            tokens1 = set(re.findall(r"[a-z0-9_]+", str(text1).lower()))
+                            tokens2 = set(re.findall(r"[a-z0-9_]+", str(text2).lower()))
+                            if not tokens1 or not tokens2:
+                                return 0.0
+                            return len(tokens1 & tokens2)/len(tokens1|tokens2)
+                    
+                    def extract_entities_from_text(text):
+                        """Simple entity extraction"""
+                        entities = []
+                        # Table.column patterns
+                        entities.extend(re.findall(r'([A-Za-z][A-Za-z0-9_]*)\.[A-Za-z][A-Za-z0-9_]*', text))
+                        # Identifiers with underscores
+                        entities.extend(re.findall(r'[A-Za-z][A-Za-z0-9_]{3,}', text))
+                        return list(set(entities))
+                    
+                    if not st.session_state.connected:
+                        st.error("Please connect to Neo4j first")
+                        st.stop()
+                    
+                    bot = st.session_state.chatbot
+                    progress_bar = st.progress(0)
+                    
+                    nlu_results = []
+                    for i, (_, row) in enumerate(nlu_df.iterrows()):
+                        query = row['query']
+                        gt_answer = row.get('answer', '')
+                        gt_entities = row.get('entities', '')
+                        
+                        # Process query
+                        try:
+                            res = bot.enhanced_process_query(query)
+                        except AttributeError:
+                            res = bot.process_query(query)
+                        
+                        response = res.get('response') or bot.generate_response(res)
+                        intent, _ = bot.predict_intent(query)
+                        
+                        # Semantic similarity
+                        sem_sim = compute_semantic_similarity(response, gt_answer) if gt_answer else 0.0
+                        
+                        # Entity F1
+                        pred_entities = extract_entities_from_text(response)
+                        gt_entities_list = [e.strip() for e in str(gt_entities).split(',') if e.strip()] if gt_entities else []
+                        # Normalize entities for fair comparison (case, symbols)
+                        def norm(x: str) -> str:
+                            x = x.strip().lower()
+                            x = re.sub(r'[^a-z0-9_]+', '_', x)
+                            x = re.sub(r'_+', '_', x)
+                            return x.strip('_')
+                        pred_norm = {norm(e) for e in pred_entities if e}
+                        gt_norm = {norm(e) for e in gt_entities_list if e}
+                        
+                        if gt_norm:
+                            tp = len(pred_norm & gt_norm)
+                            fp = len(pred_norm - gt_norm)
+                            fn = len(gt_norm - pred_norm)
+                            
+                            entity_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                            entity_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                            entity_f1 = 2 * entity_precision * entity_recall / (entity_precision + entity_recall) if (entity_precision + entity_recall) > 0 else 0.0
+                        else:
+                            entity_precision = entity_recall = entity_f1 = 0.0
+                        
+                        # Response quality metrics
+                        response_length = len(response.split())
+                        has_structured_response = any(marker in response for marker in ['📋', '🔍', '⚡', '📊'])
+                        
+                        nlu_results.append({
+                            'query': query,
+                            'intent': intent,
+                            'semantic_similarity': sem_sim,
+                            'entity_precision': entity_precision,
+                            'entity_recall': entity_recall,
+                            'entity_f1': entity_f1,
+                            'response_length': response_length,
+                            'structured_response': has_structured_response,
+                            'predicted_entities': len(pred_entities),
+                            'ground_truth_entities': len(gt_entities_list)
+                        })
+                        
+                        progress_bar.progress((i + 1) / len(nlu_df))
+                    
+                    if nlu_results:
+                        nlu_results_df = pd.DataFrame(nlu_results)
+                        
+                        # Aggregate NLU metrics
+                        nlu_agg = {
+                            'Avg_Semantic_Similarity': nlu_results_df['semantic_similarity'].mean(),
+                            'Avg_Entity_Precision': nlu_results_df['entity_precision'].mean(),
+                            'Avg_Entity_Recall': nlu_results_df['entity_recall'].mean(),
+                            'Avg_Entity_F1': nlu_results_df['entity_f1'].mean(),
+                            'Avg_Response_Length': nlu_results_df['response_length'].mean(),
+                            'Structured_Response_Rate': nlu_results_df['structured_response'].mean()
+                        }
+                        
+                        st.json(nlu_agg)
+                        
+                        # NLU Visualizations
+                        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+                        
+                        # Semantic similarity distribution
+                        axes[0,0].hist(nlu_results_df['semantic_similarity'], bins=15, alpha=0.7, color='blue')
+                        axes[0,0].set_title('Semantic Similarity Distribution')
+                        axes[0,0].set_xlabel('Similarity Score')
+                        
+                        # Entity F1 scores
+                        axes[0,1].hist(nlu_results_df['entity_f1'], bins=10, alpha=0.7, color='green')
+                        axes[0,1].set_title('Entity F1 Score Distribution')
+                        axes[0,1].set_xlabel('F1 Score')
+                        
+                        # Intent distribution
+                        intent_counts = nlu_results_df['intent'].value_counts()
+                        axes[0,2].pie(intent_counts.values, labels=intent_counts.index, autopct='%1.1f%%')
+                        axes[0,2].set_title('Intent Distribution')
+                        
+                        # Response length vs semantic similarity
+                        axes[1,0].scatter(nlu_results_df['response_length'], nlu_results_df['semantic_similarity'], alpha=0.6)
+                        axes[1,0].set_xlabel('Response Length')
+                        axes[1,0].set_ylabel('Semantic Similarity')
+                        axes[1,0].set_title('Response Length vs Similarity')
+                        
+                        # Entity metrics comparison
+                        entity_metrics = ['entity_precision', 'entity_recall', 'entity_f1']
+                        entity_scores = [nlu_results_df[metric].mean() for metric in entity_metrics]
+                        axes[1,1].bar(['Precision', 'Recall', 'F1'], entity_scores, color=['red', 'blue', 'green'])
+                        axes[1,1].set_title('Entity Extraction Performance')
+                        axes[1,1].set_ylabel('Score')
+                        
+                        # Performance by intent
+                        intent_perf = nlu_results_df.groupby('intent')['semantic_similarity'].mean().sort_values(ascending=False)
+                        axes[1,2].barh(range(len(intent_perf)), intent_perf.values)
+                        axes[1,2].set_yticks(range(len(intent_perf)))
+                        axes[1,2].set_yticklabels([intent.replace('_', '\n') for intent in intent_perf.index])
+                        axes[1,2].set_title('Semantic Similarity by Intent')
+                        axes[1,2].set_xlabel('Avg Similarity')
+                        
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        
+                        st.dataframe(nlu_results_df, use_container_width=True)
+                        benchmark_results['NLU'] = nlu_agg
+                
+                except Exception as e:
+                    st.error(f"NLU evaluation failed: {e}")
+            
+            # === COMPREHENSIVE REPORT ===
+            if benchmark_results:
+                st.markdown("##### Comprehensive Benchmark Report")
+                
+                report_data = []
+                if 'IR' in benchmark_results:
+                    for metric, value in benchmark_results['IR'].items():
+                        report_data.append({'Category': 'Information Retrieval', 'Metric': metric, 'Score': round(value, 4)})
+                
+                if 'NLU' in benchmark_results:
+                    for metric, value in benchmark_results['NLU'].items():
+                        report_data.append({'Category': 'Natural Lang Understanding', 'Metric': metric, 'Score': round(value, 4)})
+                
+                if report_data:
+                    report_df = pd.DataFrame(report_data)
+                    st.dataframe(report_df, use_container_width=True)
+                    
+                    # Download comprehensive results
+                    all_results = {
+                        'summary': benchmark_results,
+                        'timestamp': pd.Timestamp.now().isoformat()
+                    }
+                    st.download_button(
+                        "Download Comprehensive Benchmark Results", 
+                        json.dumps(all_results, indent=2), 
+                        file_name="academic_benchmark_results.json", 
+                        mime="application/json"
+                    )
 
     # Schema & exports
-    with tabs[2]:
+    with tabs[3]:
         if not st.session_state.connected:
             st.info("Connect to view schema and export options.")
         else:
