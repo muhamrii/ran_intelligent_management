@@ -45,6 +45,10 @@ def init_state():
         st.session_state.model_enabled = True
     if 'model_dir' not in st.session_state:
         st.session_state.model_dir = ''
+    if 'use_caching' not in st.session_state:
+        st.session_state.use_caching = True
+    if 'performance_mode' not in st.session_state:
+        st.session_state.performance_mode = 'balanced'  # 'fast', 'balanced', 'comprehensive'
 
 def discover_model_dir() -> str | None:
     candidates = [
@@ -93,13 +97,14 @@ def keyword_intent_predict(text: str) -> str:
 
 
 # --- Connection and initialization ---
-def connect(uri: str, user: str, password: str, enable_model: bool, model_dir: str | None):
+def connect(uri: str, user: str, password: str, enable_model: bool, model_dir: str | None, use_caching: bool = True):
     try:
         integrator = RANNeo4jIntegrator(uri, user, password)
         bot = EnhancedRANChatbot(
             integrator,
             use_domain_model=enable_model,
-            model_dir=model_dir
+            model_dir=model_dir,
+            use_caching=use_caching
         )
         st.session_state.chatbot = bot
         st.session_state.connected = True
@@ -120,11 +125,27 @@ def sidebar():
     model_enabled = st.checkbox("Use fine-tuned intent model", value=st.session_state.model_enabled)
     auto_dir = discover_model_dir() or ''
     model_dir = st.text_input("Model directory (auto-detected if empty)", value=st.session_state.model_dir or auto_dir)
+    
+    st.markdown("---")
+    st.subheader("🚀 Performance Settings")
+    use_caching = st.checkbox("Enable caching", value=st.session_state.use_caching, 
+                             help="Cache query results and entity extractions for better performance")
+    
+    performance_mode = st.selectbox(
+        "Performance mode",
+        ['fast', 'balanced', 'comprehensive'],
+        index=['fast', 'balanced', 'comprehensive'].index(st.session_state.performance_mode),
+        help="Fast: Skip expensive processes, Balanced: Selective processing, Comprehensive: Run all processes"
+    )
+    
+    # Update session state
+    st.session_state.use_caching = use_caching
+    st.session_state.performance_mode = performance_mode
 
     cols = st.columns(2)
     with cols[0]:
         if st.button("Connect"):
-            ok, msg = connect(uri, user, pwd, model_enabled, model_dir or None)
+            ok, msg = connect(uri, user, pwd, model_enabled, model_dir or None, use_caching)
             if ok:
                 st.session_state.model_enabled = model_enabled
                 st.session_state.model_dir = model_dir
@@ -138,6 +159,12 @@ def sidebar():
 
     if st.session_state.connected:
         st.info("Connected to Neo4j")
+        
+        # Show cache statistics if available
+        if hasattr(st.session_state.chatbot, 'get_cache_stats'):
+            cache_stats = st.session_state.chatbot.get_cache_stats()
+            st.metric("Cache Hit Rate", f"{cache_stats.get('hit_rate', 0)}%")
+            st.metric("Avg Query Time", f"{cache_stats.get('avg_query_time', 0)}s")
     else:
         st.warning("Not connected")
 
@@ -200,6 +227,8 @@ def handle_chat(query: str):
         'debug': result.get('debug'),
         'latency_ms': round(latency, 1),
         'time': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'cache_hit': result.get('cache_hit', False),
+        'query_time': result.get('query_time', latency / 1000)
     }
     
     # Add parallel processing metadata if available
@@ -209,12 +238,23 @@ def handle_chat(query: str):
             'top_columns_count': len(result.get('top_columns', [])),
             'processing_time_ms': result.get('processing_time_ms', latency),
             'processes_executed': len(result.get('parallel_results', {})),
-            'parallel_stats': result.get('debug', {}).get('processing_stats', {})
+            'parallel_stats': result.get('debug', {}).get('processing_stats', {}),
+            'performance_stats': result.get('performance', {})
         })
+    
+    # Enhanced entity information
+    entities = result.get('entities', {})
+    if entities:
+        meta['extracted_entities'] = {
+            'technical_terms': entities.get('technical_terms', []),
+            'measurements': entities.get('measurements', []),
+            'network_elements': entities.get('network', []),
+            'confidence_scores': entities.get('confidence_scores', {})
+        }
     
     # Add gentle hint if empty/"No results"
     if not response or response.strip().lower() in {"no results found.", "no matching tables or columns found."}:
-        response += "\n\nTip: Try adding a table or column hint (e.g., 'EUtranFrequency' or 'cell_config'), or a domain keyword like 'power' or 'frequency'."
+        response += "\n\nTip: Try adding a table or column hint (e.g., 'BoundaryOrdinaryClock' or 'AnrFunction'), or a domain keyword like 'power' or 'frequency'."
     
     st.session_state.chat.append({'q': query, 'a': response, 'meta': meta})
 
@@ -270,6 +310,31 @@ def chat_tab(example_prefill: str):
                     if error_processes:
                         st.caption(f"⚠️ Errors: {', '.join(error_processes)}")
                 
+                # Enhanced entity extraction display
+                if m.get('extracted_entities'):
+                    entities = m['extracted_entities']
+                    st.caption("**Extracted Entities:**")
+                    
+                    # Technical terms
+                    if entities.get('technical_terms'):
+                        st.caption(f"🔧 Technical: {', '.join(entities['technical_terms'][:5])}")
+                    
+                    # Measurements
+                    if entities.get('measurements'):
+                        st.caption(f"📊 Measurements: {', '.join(entities['measurements'][:3])}")
+                    
+                    # Network elements
+                    if entities.get('network_elements'):
+                        st.caption(f"🌐 Network: {', '.join(entities['network_elements'][:3])}")
+                
+                # Performance indicators
+                if m.get('cache_hit'):
+                    st.caption("⚡ Cache Hit - Fast Response")
+                elif m.get('query_time', 0) < 0.1:
+                    st.caption("🚀 Ultra-fast Response")
+                elif m.get('query_time', 0) > 5.0:
+                    st.caption("🐌 Slow Response - Consider optimization")
+                
             else:
                 # Standard display for other result types
                 cols = st.columns(5)
@@ -293,12 +358,27 @@ def chat_tab(example_prefill: str):
             # Show additional debug info for parallel processing
             if m.get('type') == 'parallel_aggregated' and dbg.get('processes_run'):
                 with st.expander("🔍 Detailed Processing Info", expanded=False):
-                    st.json({
+                    debug_info = {
                         'processes_executed': dbg.get('processes_run', []),
                         'processing_stats': m.get('parallel_stats', {}),
                         'entities_extracted': bool(m.get('entities')),
-                        'domain_identified': bool(m.get('domain'))
-                    })
+                        'domain_identified': bool(m.get('domain')),
+                        'cache_performance': {
+                            'cache_hit': m.get('cache_hit', False),
+                            'query_time': f"{m.get('query_time', 0):.3f}s"
+                        }
+                    }
+                    
+                    # Add performance timing if available
+                    if m.get('performance_stats'):
+                        debug_info['timing_breakdown'] = m['performance_stats']
+                    
+                    # Add entity confidence scores if available
+                    entities = m.get('extracted_entities', {})
+                    if entities.get('confidence_scores'):
+                        debug_info['entity_confidence'] = entities['confidence_scores']
+                    
+                    st.json(debug_info)
 
 
 def research_tab():

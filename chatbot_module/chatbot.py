@@ -72,48 +72,150 @@ class OptimizedQueryInterface:
         return self.cached_query(search_query, {'search_query': query, 'limit': limit})
 
 class EnhancedRANEntityExtractor:
-    """Advanced entity extraction for RAN domain"""
+    """Advanced entity extraction for RAN domain with improved patterns"""
     
-    def __init__(self, neo4j_integrator):
+    def __init__(self, neo4j_integrator, use_cache: bool = True):
         self.integrator = neo4j_integrator
+        self.use_cache = use_cache
         
-        # RAN-specific entity patterns
+        # Caching for entity extraction
+        self._entity_cache: Dict[str, Dict] = {}
+        self._cache_timestamps: Dict[str, float] = {}
+        self.cache_ttl = 1800  # 30 minutes for entity cache
+        
+        # Enhanced RAN-specific entity patterns with better coverage
         self.ran_patterns = {
-            'cell_id': r'cell[_\s]*id[_\s]*\d*',
-            'frequency': r'(?:\d+\s*(?:mhz|ghz|khz))|\bfreq\b|\bfrequency\b|band(?:width)?',
-            'power': r'(?:\d+\s*(?:dbm|watts?|mw))|\bpower\b|\bdbm\b',
-            'coordinates': r'lat|lon|latitude|longitude|x_coord|y_coord',
-            'timestamps': r'timestamp|time|date|created|updated',
-            'identifiers': r'[a-z]+_id|id_[a-z]+|uuid|guid',
-            'measurements': r'rsrp|rsrq|sinr|throughput|latency|kpi|metric|cqi|bler'
+            'cell_id': r'\b(?:cell|enodeb|gnodeb|sector)[_\s]*(?:id|identifier)[_\s]*\d*\b',
+            'frequency': r'\b(?:\d+\s*(?:mhz|ghz|khz|hz)|freq(?:uency)?|band(?:width)?|carrier|spectrum|eutra)\w*\b',
+            'power': r'\b(?:\d+\s*(?:dbm|watts?|mw|kw)|power|energy|consumption|efficiency|dbm)\w*\b',
+            'timing': r'\b(?:timing|sync(?:hronization)?|clock|ptp|ntp|time|temporal)\w*\b',
+            'coordinates': r'\b(?:lat(?:itude)?|lon(?:gitude)?|x_coord|y_coord|position|location)\w*\b',
+            'timestamps': r'\b(?:timestamp|time|date|created|updated|modified)\w*\b',
+            'identifiers': r'\b(?:[a-z]+_id|id_[a-z]+|uuid|guid|identifier)\w*\b',
+            'measurements': r'\b(?:rsrp|rsrq|sinr|throughput|latency|kpi|metric|cqi|bler|quality|performance)\w*\b',
+            'network': r'\b(?:neighbor|handover|mobility|roaming|adjacency|anr|relation)\w*\b',
+            'configuration': r'\b(?:config(?:uration)?|parameter|setting|threshold|setup)\w*\b'
+        }
+        
+        # Confidence thresholds for different pattern types
+        self.pattern_confidence = {
+            'cell_id': 0.9, 'frequency': 0.8, 'power': 0.8, 'timing': 0.8,
+            'measurements': 0.7, 'network': 0.7, 'configuration': 0.6,
+            'coordinates': 0.6, 'timestamps': 0.5, 'identifiers': 0.5
         }
     
+    def _is_cache_valid(self, cache_key: str) -> bool:
+        """Check if entity cache entry is still valid"""
+        if not self.use_cache:
+            return False
+        
+        timestamp = self._cache_timestamps.get(cache_key)
+        if timestamp is None:
+            return False
+        
+        return (time.time() - timestamp) < self.cache_ttl
+
+    def _get_cached_entities(self, query: str) -> Dict[str, List[str]] | None:
+        """Get cached entity extraction results"""
+        if not self.use_cache:
+            return None
+        
+        cache_key = hashlib.md5(query.lower().encode()).hexdigest()
+        
+        if self._is_cache_valid(cache_key) and cache_key in self._entity_cache:
+            return self._entity_cache[cache_key]
+        
+        return None
+
+    def _cache_entities(self, query: str, entities: Dict[str, List[str]]) -> None:
+        """Cache entity extraction results"""
+        if not self.use_cache:
+            return
+        
+        cache_key = hashlib.md5(query.lower().encode()).hexdigest()
+        self._entity_cache[cache_key] = entities
+        self._cache_timestamps[cache_key] = time.time()
+    
     def extract_technical_entities(self, query: str) -> Dict[str, List[str]]:
-        """Extract RAN-specific technical entities"""
+        """Extract RAN-specific technical entities with confidence scoring and caching"""
+        # Check cache first
+        cached_result = self._get_cached_entities(query)
+        if cached_result is not None:
+            return cached_result
+        
         entities = {
             'technical_terms': [],
             'measurements': [],
             'identifiers': [],
             'temporal': [],
-            'spatial': []
+            'spatial': [],
+            'network': [],
+            'configuration': [],
+            'table_names': [],
+            'confidence_scores': {}
         }
         
         query_lower = query.lower()
         
-        # Pattern-based extraction
+        # Enhanced pattern-based extraction with confidence
         for pattern_name, pattern in self.ran_patterns.items():
-            matches = re.findall(pattern, query_lower)
+            matches = re.findall(pattern, query_lower, re.IGNORECASE)
+            confidence = self.pattern_confidence.get(pattern_name, 0.5)
+            
             if matches:
-                if pattern_name in ['cell_id', 'identifiers']:
-                    entities['identifiers'].extend(matches)
-                elif pattern_name in ['frequency', 'power', 'measurements']:
-                    entities['measurements'].extend(matches)
-                elif pattern_name == 'timestamps':
-                    entities['temporal'].extend(matches)
-                elif pattern_name == 'coordinates':
-                    entities['spatial'].extend(matches)
+                # Categorize matches more precisely
+                category_map = {
+                    'cell_id': 'identifiers', 'frequency': 'technical_terms', 
+                    'power': 'technical_terms', 'timing': 'temporal',
+                    'measurements': 'measurements', 'network': 'network',
+                    'configuration': 'configuration', 'coordinates': 'spatial',
+                    'timestamps': 'temporal', 'identifiers': 'identifiers'
+                }
+                
+                category = category_map.get(pattern_name, 'technical_terms')
+                
+                for match in matches:
+                    normalized_match = self._normalize_entity(match)
+                    if normalized_match not in entities[category]:
+                        entities[category].append(normalized_match)
+                        entities['confidence_scores'][normalized_match] = confidence
+        
+        # Extract table names mentioned in query
+        table_entities = self._extract_table_entities(query)
+        entities['table_names'] = table_entities
+        
+        # Cache the results
+        self._cache_entities(query, entities)
         
         return entities
+    
+    def _normalize_entity(self, entity: str) -> str:
+        """Normalize entity for better matching"""
+        # Convert to lowercase, remove extra spaces, normalize underscores
+        normalized = entity.strip().lower()
+        normalized = re.sub(r'\s+', '_', normalized)
+        normalized = re.sub(r'[^\w]', '', normalized)
+        return normalized
+    
+    def _extract_table_entities(self, query: str) -> List[str]:
+        """Extract potential table names from query"""
+        # Get known table names from Neo4j for matching
+        try:
+            with self.integrator.driver.session() as session:
+                result = session.run("MATCH (t:Table) RETURN t.name as name LIMIT 100")
+                known_tables = [record['name'] for record in result]
+            
+            query_lower = query.lower()
+            mentioned_tables = []
+            
+            for table_name in known_tables:
+                if table_name.lower() in query_lower:
+                    mentioned_tables.append(table_name)
+            
+            return mentioned_tables
+            
+        except Exception:
+            return []
     
     def contextualized_search(self, query: str, entities: Dict) -> Tuple[str, Dict]:
         """Generate contextualized Cypher query based on entities"""
@@ -674,23 +776,6 @@ class RANChatbot:
             'results': results
         }
     
-    def _extract_table_name(self, query: str) -> str:
-        """Extract table name from query (improved heuristic)"""
-        words = query.split()
-        
-        # Look for words that look like table names
-        for word in words:
-            word_clean = word.strip('.,!?').lower()
-            if ('_' in word_clean or 
-                word_clean.endswith('config') or 
-                word_clean.endswith('data') or
-                word_clean.endswith('table') or
-                word_clean.endswith('counters') or
-                word_clean.endswith('relations')):
-                return word_clean.replace('table', '').strip()
-        
-        return None
-
     def generate_response(self, query_result: Dict) -> str:
         """Generate a natural language response from query results"""
         if query_result['type'] == 'domain_inquiry':
@@ -862,15 +947,37 @@ class RANChatbot:
 class EnhancedRANChatbot(RANChatbot):
     """Enhanced chatbot with optimizations and domain-specific capabilities"""
 
-    def __init__(self, neo4j_integrator, use_domain_model: bool = False, model_dir: str | None = None):
+    def __init__(self, neo4j_integrator, use_domain_model: bool = False, model_dir: str | None = None, use_caching: bool = True):
         super().__init__(neo4j_integrator)
 
         # Enhanced components
         self.optimized_query = OptimizedQueryInterface(neo4j_integrator)
-        self.entity_extractor = EnhancedRANEntityExtractor(neo4j_integrator)
+        self.entity_extractor = EnhancedRANEntityExtractor(neo4j_integrator, use_cache=use_caching)
         self.graph_traversal = IntelligentGraphTraversal(neo4j_integrator)
+        
+        # Caching system
+        self.use_caching = use_caching
+        self._query_cache: Dict[str, Any] = {}
+        self._table_metadata_cache: Dict[str, Dict] = {}
+        self._embedding_cache: Dict[str, Any] = {}
+        self._domain_cache: Dict[str, set] = {}
+        
+        # Cache management
+        self.cache_ttl = 3600  # 1 hour TTL
+        self._cache_timestamps: Dict[str, float] = {}
+        
+        # Performance tracking
+        self._query_times: List[float] = []
+        self._cache_hits = 0
+        self._cache_misses = 0
+        
         # Cache of last domain tables for ranking boosts
         self._last_domain_tables: set[str] = set()
+        
+        # Pre-compile regex patterns for performance - Enhanced for snake_case and PascalCase  
+        self._table_name_pattern = re.compile(r'\b([A-Z][A-Z0-9_]*[A-Z0-9]|[A-Z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)*)\b')
+        self._camel_case_pattern = re.compile(r'([a-z])([A-Z])')
+        
         # Intent routing and synonyms to better guide retrieval
         self.intent_domain_map = {
             'performance_analysis': 'performance',
@@ -923,48 +1030,141 @@ class EnhancedRANChatbot(RANChatbot):
             except Exception as e:
                 print(f"Domain-specific model not found: {e}")
                 print("Using default intent detection")
+        
+        # Initialize cache warm-up if enabled
+        if self.use_caching:
+            self._warm_up_cache()
+    
+    def _is_cache_valid(self, cache_key: str) -> bool:
+        """Check if cache entry is still valid based on TTL."""
+        if not self.use_caching:
+            return False
+        
+        timestamp = self._cache_timestamps.get(cache_key)
+        if timestamp is None:
+            return False
+        
+        return (time.time() - timestamp) < self.cache_ttl
+
+    def _set_cache(self, cache_key: str, value: Any, cache_dict: Dict[str, Any]) -> None:
+        """Set cache value with timestamp."""
+        if self.use_caching:
+            cache_dict[cache_key] = value
+            self._cache_timestamps[cache_key] = time.time()
+
+    def _warm_up_cache(self) -> None:
+        """Pre-populate cache with frequently used data."""
+        if not self.use_caching:
+            return
+        
+        try:
+            # Cache all table names for fast lookup
+            all_tables = self._get_all_table_names_cached()
+            self._set_cache('all_tables', all_tables, self._table_metadata_cache)
+            
+            # Pre-cache domain classifications
+            domain_keywords = {
+                'power': ['power', 'energy', 'consumption', 'efficiency', 'dbm', 'watt'],
+                'frequency': ['frequency', 'spectrum', 'band', 'carrier', 'freq', 'hertz'],
+                'timing': ['timing', 'sync', 'synchronization', 'clock', 'time', 'ptp'],
+                'performance': ['performance', 'kpi', 'metric', 'quality', 'throughput', 'latency'],
+                'cell': ['cell', 'sector', 'antenna', 'base', 'node', 'enode'],
+                'network': ['network', 'neighbor', 'relation', 'handover', 'mobility', 'anr']
+            }
+            
+            for domain, keywords in domain_keywords.items():
+                domain_tables = set()
+                for table in all_tables:
+                    table_lower = table.lower()
+                    if any(keyword in table_lower for keyword in keywords):
+                        domain_tables.add(table)
+                self._set_cache(f'domain_{domain}', domain_tables, self._domain_cache)
+                
+        except Exception as e:
+            print(f"Warning: Cache warm-up failed: {e}")
+
+    def _get_all_table_names_cached(self) -> List[str]:
+        """Get all table names with caching."""
+        cache_key = 'all_tables'
+        
+        if self._is_cache_valid(cache_key) and cache_key in self._table_metadata_cache:
+            self._cache_hits += 1
+            return self._table_metadata_cache[cache_key]
+        
+        self._cache_misses += 1
+        
+        try:
+            with self.integrator.driver.session() as session:
+                # Get actual table nodes, not just labels
+                result = session.run("MATCH (t:Table) RETURN t.name as name ORDER BY t.name")
+                tables = [record["name"] for record in result]
+                
+            self._set_cache(cache_key, tables, self._table_metadata_cache)
+            return tables
+            
+        except Exception as e:
+            print(f"Warning: Failed to get table names: {e}")
+            return []
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache performance statistics."""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0
+        
+        return {
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate': round(hit_rate * 100, 2),
+            'avg_query_time': round(np.mean(self._query_times), 3) if self._query_times else 0,
+            'cache_size': len(self._query_cache) + len(self._table_metadata_cache) + len(self._embedding_cache)
+        }
     
     def enhanced_process_query(self, user_query: str) -> Dict:
-        """Parallel processing with aggregated results from all retrieval strategies"""
+        """Optimized parallel processing with caching and performance tracking"""
         start_time = time.time()
         
-        # Get intent prediction
+        # Check query cache first
+        cache_key = hashlib.md5(user_query.lower().encode()).hexdigest()
+        if self._is_cache_valid(cache_key) and cache_key in self._query_cache:
+            self._cache_hits += 1
+            cached_result = self._query_cache[cache_key]
+            cached_result['cache_hit'] = True
+            cached_result['query_time'] = time.time() - start_time
+            return cached_result
+        
+        self._cache_misses += 1
+        
+        # Get intent prediction with caching
         intent, confidence = self.predict_intent(user_query)
         
-        # Initialize result aggregator (add query token tracking for improved ranking)
+        # Initialize result aggregator with performance tracking
         tokens = [t for t in re.split(r"[^a-z0-9]+", user_query.lower()) if t and len(t) > 1]
         result_aggregator = {
             'all_tables': {},  # table_name -> {count, sources, details, sample_columns}
             'all_columns': {},  # column_name -> {count, sources, table}
             'key_results': {},  # detailed per-process results
             'processing_stats': {},
-            'query_tokens': tokens
+            'query_tokens': tokens,
+            'performance': {
+                'start_time': start_time,
+                'process_times': {},
+                'cache_usage': {}
+            }
         }
         
-        # Run all processes in parallel and collect results
-        parallel_results = self._run_parallel_processes(user_query, intent, result_aggregator)
+        # Run optimized parallel processes
+        parallel_results = self._run_parallel_processes_optimized(user_query, intent, result_aggregator)
         
-        # Aggregate and rank all tables/columns
+        # Aggregate and rank with enhanced scoring
         top_tables = self._rank_aggregated_tables(result_aggregator['all_tables'], result_aggregator)
-        # Fallback: if we have zero tables, attempt semantic search over individual query tokens to recover something
+        
+        # Intelligent fallback with caching
         if not top_tables:
-            try:
-                seen = set()
-                for tok in result_aggregator.get('query_tokens', [])[:4]:
-                    if len(tok) < 3:  # skip very short tokens
-                        continue
-                    results = self.query_interface.semantic_search(tok)
-                    for r in results[:5]:
-                        tname = r.get('table_name')
-                        if tname and tname not in seen:
-                            seen.add(tname)
-                            self._add_table_to_aggregator(tname, 'fallback_token_search', r, result_aggregator)
-                # Re-rank after fallback
-                top_tables = self._rank_aggregated_tables(result_aggregator['all_tables'], result_aggregator)
-            except Exception:
-                pass
+            top_tables = self._intelligent_fallback_search(result_aggregator)
+            
         top_columns = self._rank_aggregated_columns(result_aggregator['all_columns'])
-        # Ensure explicitly referenced table (if any) is surfaced even if low evidence
+        
+        # Ensure explicitly referenced table surfaces
         explicit_table = result_aggregator['key_results'].get('explicit_table')
         if explicit_table and explicit_table not in [t['table_name'] for t in top_tables]:
             # Add explicit table with high priority score
@@ -1359,71 +1559,195 @@ class EnhancedRANChatbot(RANChatbot):
         aggregator['all_columns'][column_name]['relevance_score'] += 1
 
     def _rank_aggregated_tables(self, all_tables: Dict, aggregator: Dict | None = None) -> List[Dict]:
-        """Rank tables using multi-factor scoring with token matching & pseudo-IDF.
-        Factors (additive weighted):
-          - frequency: how many processes surfaced the table
-          - relevance_score: accumulated boosts from source processors
-          - diversity: number of distinct retrieval sources
-          - domain_boost: if table in last domain tables set
-          - token_match: overlap between query tokens and table / sample columns (BM25-like)
-          - column_variety: number of harvested sample columns
-        Provides per-table debug signal vector to aid evaluation / tuning.
+        """Rank tables using advanced multi-factor scoring with semantic similarity.
+        Factors (weighted combination):
+          - frequency: how many processes surfaced the table (30%)
+          - semantic_match: semantic similarity between query and table context (25%)
+          - token_match: BM25-style token overlap scoring (20%) 
+          - domain_boost: domain alignment bonus (10%)
+          - relationship_richness: connection quality and diversity (10%)
+          - column_relevance: relevant column count and variety (5%)
         """
         ranked_tables: List[Dict] = []
         query_tokens = set((aggregator or {}).get('query_tokens', []))
-        # Build corpus statistics for pseudo-IDF over sample columns
+        
+        # Build enhanced corpus statistics
         token_df: Dict[str,int] = {}
+        all_text_tokens = set()
+        
         for info in all_tables.values():
-            seen_tokens = set()
+            table_tokens = set()
+            # Collect tokens from table name and columns
             cols = list(info.get('sample_columns') or [])
-            for c in cols:
-                for tok in re.split(r"[^a-z0-9]+", c.lower()):
+            all_text = [info.get('table_name', '')] + cols
+            
+            for text in all_text:
+                for tok in re.split(r"[^a-z0-9]+", text.lower()):
                     if tok and len(tok) > 1:
-                        seen_tokens.add(tok)
-            for tok in seen_tokens:
-                token_df[tok] = token_df.get(tok,0)+1
-        N = max(len(all_tables),1)
+                        table_tokens.add(tok)
+                        all_text_tokens.add(tok)
+            
+            # Update document frequency
+            for tok in table_tokens:
+                token_df[tok] = token_df.get(tok, 0) + 1
+        
+        N = max(len(all_tables), 1)
+        
         for table_name, info in all_tables.items():
+            # Base scoring components
+            frequency = info['count']
+            base_relevance = info['relevance_score']
             diversity = len(set(info['sources']))
-            freq_component = info['count'] * 2.0
-            relevance_component = info['relevance_score'] * 1.0
-            diversity_component = diversity * 1.2
-            domain_component = 1.5 if (table_name in getattr(self, '_last_domain_tables', set())) else 0.0
-            # Token match scoring
             sample_cols = list(info.get('sample_columns') or [])
+            
+            # 1. Frequency score (30% weight)
+            frequency_score = min(frequency * 8.0, 30.0)  # Cap at 30
+            
+            # 2. Semantic matching score (25% weight) 
+            semantic_score = self._compute_semantic_similarity(table_name, sample_cols, query_tokens, all_text_tokens)
+            
+            # 3. Enhanced token matching with BM25 (20% weight)
+            token_match_score = self._compute_bm25_score(table_name, sample_cols, query_tokens, token_df, N)
+            
+            # 4. Domain boost (10% weight)
+            domain_component = 10.0 if (table_name in getattr(self, '_last_domain_tables', set())) else 0.0
+            
+            # 5. Relationship richness (10% weight)
+            relationship_score = min(diversity * 3.0, 10.0)  # Reward diverse sources
+            
+            # 6. Column relevance (5% weight)
+            column_variety = min(len(set(sample_cols)), 10)
+            column_score = (column_variety / 10.0) * 5.0
+            
+            # Combine with weights
+            total_score = (
+                frequency_score * 0.30 +
+                semantic_score * 0.25 +
+                token_match_score * 0.20 +
+                domain_component * 0.10 +
+                relationship_score * 0.10 +
+                column_score * 0.05
+            )
+            
+            # Calculate matched tokens for debugging
             col_tokens = []
-            for c in sample_cols:
-                col_tokens.extend([t for t in re.split(r"[^a-z0-9]+", c.lower()) if t and len(t)>1])
-            if table_name:
-                col_tokens.extend([t for t in re.split(r"[^a-z0-9]+", table_name.lower()) if t and len(t)>1])
-            token_match_score = 0.0
-            matched_tokens = set()
-            for tok in query_tokens:
-                tf = col_tokens.count(tok)
-                if tf:
-                    df = token_df.get(tok,1)
-                    idf = np.log( (N - df + 0.5) / (df + 0.5) + 1 )  # BM25 style idf
-                    # Simple BM25-like tf normalization
-                    token_match_score += (tf / (tf + 1.5)) * idf * 2.0
-                    matched_tokens.add(tok)
-            column_variety = min(len(set(sample_cols)), 12)
-            column_variety_component = 0.3 * (column_variety/12)
-            total = freq_component + relevance_component + diversity_component + domain_component + token_match_score + column_variety_component
+            for c in sample_cols + [table_name]:
+                if c:
+                    col_tokens.extend([t for t in re.split(r"[^a-z0-9]+", c.lower()) if t and len(t)>1])
+            
+            matched_tokens = [tok for tok in query_tokens if tok in col_tokens]
+            
             ranked_tables.append({
                 'table_name': table_name,
-                'frequency': info['count'],
+                'frequency': frequency,
                 'sources': list(set(info['sources'])),
-                'relevance_score': info['relevance_score'],
+                'relevance_score': base_relevance,
                 'source_diversity': diversity,
                 'domain_boost': domain_component,
-                'token_match_score': round(token_match_score,4),
-                'matched_query_tokens': list(matched_tokens),
+                'token_match_score': round(token_match_score, 3),
+                'semantic_score': round(semantic_score, 3),
+                'frequency_score': round(frequency_score, 3),
+                'relationship_score': round(relationship_score, 3),
+                'column_score': round(column_score, 3),
+                'matched_query_tokens': matched_tokens,
                 'column_variety': column_variety,
-                'total_score': round(total,4),
-                'sample_columns': list(info.get('sample_columns') or [])
+                'total_score': round(total_score, 3),
+                'sample_columns': sample_cols[:8]  # Limit for response size
             })
-        ranked_tables.sort(key=lambda x: (x['total_score'], x['token_match_score'], x['source_diversity']), reverse=True)
+        
+        # Sort by total score, then by semantic score, then by frequency
+        ranked_tables.sort(key=lambda x: (x['total_score'], x['semantic_score'], x['frequency']), reverse=True)
         return ranked_tables
+    
+    def _compute_semantic_similarity(self, table_name: str, sample_cols: List[str], 
+                                   query_tokens: set, all_tokens: set) -> float:
+        """Compute semantic similarity between query and table context"""
+        if not query_tokens:
+            return 0.0
+        
+        # Collect all table-related text
+        table_text = [table_name] + sample_cols
+        table_tokens = set()
+        
+        for text in table_text:
+            if text:
+                tokens = [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and len(t) > 1]
+                table_tokens.update(tokens)
+        
+        if not table_tokens:
+            return 0.0
+        
+        # Jaccard similarity with token overlap
+        intersection = len(query_tokens.intersection(table_tokens))
+        union = len(query_tokens.union(table_tokens))
+        
+        if union == 0:
+            return 0.0
+        
+        jaccard = intersection / union
+        
+        # Boost for exact matches and semantic relationships
+        semantic_boost = 0.0
+        
+        # Check for domain-specific semantic relationships
+        domain_synonyms = {
+            'power': ['energy', 'consumption', 'efficiency', 'dbm', 'watt'],
+            'frequency': ['spectrum', 'band', 'carrier', 'freq', 'hertz'],
+            'timing': ['sync', 'synchronization', 'clock', 'time', 'ptp'],
+            'performance': ['kpi', 'metric', 'quality', 'throughput', 'latency'],
+            'cell': ['sector', 'antenna', 'base', 'node', 'enode'],
+            'network': ['neighbor', 'relation', 'handover', 'mobility', 'anr']
+        }
+        
+        for domain, synonyms in domain_synonyms.items():
+            if domain in query_tokens or any(syn in query_tokens for syn in synonyms):
+                if domain in table_tokens or any(syn in table_tokens for syn in synonyms):
+                    semantic_boost += 0.1
+        
+        # Combine Jaccard with semantic boost, scale to 0-25 range
+        final_score = (jaccard + semantic_boost) * 25.0
+        return min(final_score, 25.0)
+    
+    def _compute_bm25_score(self, table_name: str, sample_cols: List[str], 
+                           query_tokens: set, token_df: Dict[str, int], N: int) -> float:
+        """Compute BM25-style scoring for token matching"""
+        if not query_tokens:
+            return 0.0
+        
+        # Collect all tokens from table and columns
+        all_table_text = [table_name] + sample_cols
+        table_tokens = []
+        
+        for text in all_table_text:
+            if text:
+                tokens = [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and len(t) > 1]
+                table_tokens.extend(tokens)
+        
+        if not table_tokens:
+            return 0.0
+        
+        # BM25 parameters
+        k1, b = 1.5, 0.75
+        doc_length = len(table_tokens)
+        avg_doc_length = 10.0  # Estimated average
+        
+        score = 0.0
+        
+        for token in query_tokens:
+            if token in table_tokens:
+                tf = table_tokens.count(token)
+                df = token_df.get(token, 1)
+                
+                # BM25 IDF
+                idf = np.log((N - df + 0.5) / (df + 0.5) + 1.0)
+                
+                # BM25 TF normalization
+                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_length / avg_doc_length)))
+                
+                score += idf * tf_norm
+        
+        # Scale to 0-20 range
+        return min(score * 2.0, 20.0)
 
     def _rank_aggregated_columns(self, all_columns: Dict) -> List[Dict]:
         """Rank columns by frequency and table association"""
@@ -1462,70 +1786,175 @@ class EnhancedRANChatbot(RANChatbot):
 
     def _generate_aggregated_response(self, user_query: str, intent: str, top_tables: List, 
                                     top_columns: List, key_results: Dict, parallel_results: Dict) -> str:
-        """Generate comprehensive response from aggregated results"""
+        """Generate comprehensive response from aggregated results with enhanced context"""
         
         if not top_tables and not top_columns:
             return "No results found across all search strategies."
         
         response_parts = []
         
-        # Add intent and domain context
+        # Add intent and domain context with more detail
         domain = key_results.get('domain')
-        if domain:
+        explicit_table = key_results.get('explicit_table')
+        
+        if explicit_table:
+            response_parts.append(f"🎯 **{intent.replace('_', ' ').title()}** - Found explicit table: **{explicit_table}**")
+        elif domain:
             response_parts.append(f"🎯 **{intent.replace('_', ' ').title()}** query in **{domain}** domain")
         else:
             response_parts.append(f"🎯 **{intent.replace('_', ' ').title()}** query analysis")
         
-        # Top tables section with sample columns for richer semantic content
+        # Enhanced top tables section with rich context
         if top_tables:
-            response_parts.append(f"\n📋 **Top {min(5, len(top_tables))} Tables (multi-strategy ranking):**")
+            response_parts.append(f"\n📋 **Top {min(5, len(top_tables))} Relevant Tables:**")
+            
             for i, table in enumerate(top_tables[:5], 1):
-                sources_str = ", ".join(table['sources'][:3])
-                if len(table['sources']) > 3:
-                    sources_str += f" (+{len(table['sources'])-3} more)"
-                sample_cols = []
-                # Retrieve sample columns from aggregator if available
-                # (We look up in all_tables via stored details)
-                # Locate aggregator by scanning original structures (cheap set comprehension)
-                try:
-                    # aggregator not directly passed; reconstruct via parallel_results domain details
-                    # fallback: use key_results table_details or domain_insights
-                    pass
-                except Exception:
-                    pass
-                # We stored sample columns inside all_tables; reuse top_tables element if extended earlier
-                if 'sample_columns' in table:
-                    sample_cols = list(table['sample_columns'])
-                # Provide fallback route using key_results
-                if not sample_cols and key_results.get('table_details') and key_results['table_details'].get('table_name') == table['table_name']:
-                    for c in key_results['table_details'].get('columns', [])[:5]:
-                        if isinstance(c, dict) and c.get('name'):
-                            sample_cols.append(c['name'])
-                snippet = f"{i}. **{table['table_name']}** (freq {table['frequency']}, diversity {table['source_diversity']}, boost {table.get('domain_boost',0):.1f})"
-                if sample_cols:
-                    snippet += f" – cols: {', '.join(sample_cols[:4])}"
-                response_parts.append(snippet)
-        
-        # Top columns section
-        if top_columns:
-            response_parts.append(f"\n🔍 **Top {min(5, len(top_columns))} Most Relevant Columns:**")
-            for i, column in enumerate(top_columns[:5], 1):
-                tables_str = ", ".join(list(column['tables'])[:2])  # Show first 2 tables
-                if len(column['tables']) > 2:
-                    tables_str += f" (+{len(column['tables'])-2} more)"
+                table_name = table['table_name']
+                sources = table.get('sources', [])
+                score = table.get('total_score', 0)
+                sample_columns = list(table.get('sample_columns', []))[:4]
                 
-                response_parts.append(
-                    f"{i}. **{column['column_name']}** "
-                    f"(in: {tables_str}, frequency: {column['frequency']})"
-                )
+                # Create rich table description
+                table_desc = f"{i}. **{table_name}**"
+                
+                # Add score and confidence indicators
+                if score > 50:
+                    table_desc += " 🟢"
+                elif score > 20:
+                    table_desc += " 🟡"
+                else:
+                    table_desc += " 🔍"
+                
+                # Add context about why this table was selected
+                source_desc = self._get_source_description(sources)
+                if source_desc:
+                    table_desc += f" ({source_desc})"
+                
+                response_parts.append(table_desc)
+                
+                # Add sample columns for better semantic context
+                if sample_columns:
+                    clean_columns = []
+                    for col in sample_columns:
+                        # Clean up column names (remove table prefixes)
+                        clean_col = col.split('.')[-1] if '.' in col else col
+                        if clean_col and len(clean_col) < 30:  # Reasonable length
+                            clean_columns.append(clean_col)
+                    
+                    if clean_columns:
+                        response_parts.append(f"   🔧 Key columns: {', '.join(clean_columns[:3])}")
+                
+                # Add domain-specific insights
+                domain_insight = self._get_domain_insight(table_name, intent)
+                if domain_insight:
+                    response_parts.append(f"   📊 {domain_insight}")
         
-        # Add key insights
-        if key_results.get('entities'):
-            entities = key_results['entities']
-            if entities.get('measurements') or entities.get('identifiers'):
-                response_parts.append(f"\n⚡ **Extracted Entities:** "
-                                     f"Measurements: {len(entities.get('measurements', []))}, "
-                                     f"Identifiers: {len(entities.get('identifiers', []))}")
+        # Enhanced columns section with context
+        if top_columns:
+            response_parts.append(f"\n🔍 **Key Columns of Interest:**")
+            for i, column in enumerate(top_columns[:5], 1):
+                col_name = column['column_name']
+                tables = list(column.get('tables', []))[:2]
+                frequency = column.get('frequency', 0)
+                
+                col_desc = f"{i}. **{col_name}**"
+                if tables:
+                    col_desc += f" (found in: {', '.join(tables)}"
+                    if len(column.get('tables', [])) > 2:
+                        col_desc += f" +{len(column.get('tables', [])) - 2} more"
+                    col_desc += ")"
+                
+                if frequency > 1:
+                    col_desc += f" - appears {frequency}x"
+                    
+                response_parts.append(col_desc)
+        
+        # Add extracted entities context
+        entities = key_results.get('entities', {})
+        if entities:
+            entity_summary = self._create_entity_summary(entities)
+            if entity_summary:
+                response_parts.append(f"\n🏷️ **Detected Entities**: {entity_summary}")
+        
+        # Add processing insights
+        processing_stats = parallel_results.get('processing_stats', {}) if isinstance(parallel_results, dict) else {}
+        successful_processes = [k for k, v in processing_stats.items() if v == 'success']
+        if successful_processes:
+            response_parts.append(f"\n⚙️ Analyzed via: {', '.join(successful_processes[:3])}")
+        
+        return "\n".join(response_parts)
+    
+    def _get_source_description(self, sources: List[str]) -> str:
+        """Get human-readable description of why table was found"""
+        if not sources:
+            return ""
+        
+        source_map = {
+            'explicit_mention': 'explicitly mentioned',
+            'explicit_reference': 'directly referenced',
+            'domain_routing': 'domain match',
+            'table_extraction': 'table analysis',
+            'entity_extraction': 'entity match',
+            'semantic_search': 'semantic similarity',
+            'concept_search': 'concept match',
+            'synonym_expansion': 'keyword expansion',
+            'relationship_analysis': 'related via graph'
+        }
+        
+        descriptions = []
+        for source in sources[:2]:  # Show top 2 reasons
+            desc = source_map.get(source, source.replace('_', ' '))
+            descriptions.append(desc)
+        
+        return ', '.join(descriptions)
+    
+    def _get_domain_insight(self, table_name: str, intent: str) -> str:
+        """Get domain-specific insight about the table"""
+        table_lower = table_name.lower()
+        
+        insights = {
+            'power': "Contains energy consumption and efficiency metrics",
+            'frequency': "Manages spectrum allocation and carrier configuration", 
+            'timing': "Tracks synchronization and clock accuracy",
+            'performance': "Monitors KPIs and quality indicators",
+            'cell': "Stores cell configuration and parameters",
+            'neighbor': "Manages handover and adjacency relationships",
+            'anr': "Automatic neighbor relation management",
+            'measurement': "Performance measurement and monitoring data"
+        }
+        
+        for keyword, insight in insights.items():
+            if keyword in table_lower:
+                return insight
+        
+        # Intent-based insights
+        intent_insights = {
+            'power_optimization': "Relevant for power efficiency analysis",
+            'frequency_management': "Used in spectrum planning",
+            'performance_analysis': "Contains performance metrics",
+            'cell_configuration': "Holds configuration parameters",
+            'timing_sync': "Related to synchronization functions"
+        }
+        
+        return intent_insights.get(intent, "")
+    
+    def _create_entity_summary(self, entities: Dict) -> str:
+        """Create a summary of detected entities"""
+        summaries = []
+        
+        if entities.get('table_names'):
+            summaries.append(f"tables({len(entities['table_names'])})")
+        
+        if entities.get('measurements'):
+            summaries.append(f"metrics({len(entities['measurements'])})")
+            
+        if entities.get('technical_terms'):
+            summaries.append(f"terms({len(entities['technical_terms'])})")
+            
+        if entities.get('network'):
+            summaries.append(f"network({len(entities['network'])})")
+        
+        return ', '.join(summaries[:3]) if summaries else ""
         
         # Add processing statistics
         success_count = sum(1 for status in parallel_results.values() 
@@ -1645,55 +2074,67 @@ class EnhancedRANChatbot(RANChatbot):
         return label, None
     
     def _extract_table_name(self, query: str) -> str:
-        """Extract table name from query using improved heuristics.
-        Supports patterns like TableName.columnName, snake_case, and PascalCase.
+        """Enhanced table name extraction for improved ground truth compatibility.
+        Supports patterns like TableName.columnName, snake_case, PascalCase, and exact matches.
         """
-        # First get all known table names from Neo4j for direct matching
+        # First get all known table names from cache or Neo4j for direct matching
+        known_tables = []
         try:
-            with self.integrator.driver.session() as session:
-                result = session.run("MATCH (t:Table) RETURN t.name as name")
-                known_tables = [record['name'] for record in result]
-                
-            # Direct table name matching (case insensitive) - prioritize longest matches
-            query_lower = query.lower()
-            matched_tables = []
-            for table_name in known_tables:
-                if table_name.lower() in query_lower:
-                    matched_tables.append((table_name, len(table_name)))
-            
-            if matched_tables:
-                # Return the longest matching table name
-                matched_tables.sort(key=lambda x: x[1], reverse=True)
-                return matched_tables[0][0]
-                
+            # Try cache first
+            cached_tables = self._table_metadata_cache.get('all_tables', [])
+            if cached_tables:
+                known_tables = cached_tables
+            else:
+                # Fallback to direct query
+                with self.integrator.driver.session() as session:
+                    result = session.run("MATCH (t:Table) RETURN t.name as name")
+                    known_tables = [record['name'] for record in result]
         except Exception:
-            pass
+            known_tables = []
         
-        # Fallback to pattern matching
-        # Dotted pattern Table.column
-        m = re.search(r'([A-Za-z][A-Za-z0-9_]*)\.[A-Za-z][A-Za-z0-9_]*', query)
-        if m:
-            return m.group(1)
-            
-        # Snake_case tokens
-        for tok in re.findall(r'[A-Za-z0-9_]+', query):
-            if '_' in tok and len(tok) > 3:
-                return tok
-                
-        # PascalCase words (join adjacent capitalized words)
-        camel_words = re.findall(r'[A-Z][a-z]+', query)
-        if len(camel_words) >= 2:
-            # Try combinations of adjacent words, prioritize longer ones
-            candidates = []
-            for i in range(len(camel_words)):
-                for j in range(i + 2, min(i + 5, len(camel_words) + 1)):  # 2-4 word combinations
-                    combined = ''.join(camel_words[i:j])
-                    if len(combined) > 8:  # Reasonable table name length
-                        candidates.append((combined, len(combined)))
-            
-            if candidates:
-                candidates.sort(key=lambda x: x[1], reverse=True)
-                return candidates[0][0]
+        if not known_tables:
+            return None
+        
+        # Strategy 1: Exact table name matching (case sensitive)
+        for table_name in known_tables:
+            if table_name in query:
+                return table_name
+        
+        # Strategy 2: Column-qualified table extraction (TableName.columnName)
+        qualified_pattern = r'\b([A-Z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)*)\.([a-zA-Z][a-zA-Z0-9]*)\b'
+        qualified_match = re.search(qualified_pattern, query)
+        if qualified_match:
+            table_candidate = qualified_match.group(1)
+            if table_candidate in known_tables:
+                return table_candidate
+        
+        # Strategy 3: Case-insensitive matching for variations
+        query_lower = query.lower()
+        matched_tables = []
+        for table_name in known_tables:
+            if table_name.lower() in query_lower:
+                matched_tables.append((table_name, len(table_name)))
+        
+        if matched_tables:
+            # Return the longest matching table name
+            matched_tables.sort(key=lambda x: x[1], reverse=True)
+            return matched_tables[0][0]
+        
+        # Strategy 4: PascalCase pattern extraction with validation
+        pascal_pattern = r'\b([A-Z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)*)\b'
+        pascal_matches = re.findall(pascal_pattern, query)
+        
+        for match in pascal_matches:
+            if match in known_tables:
+                return match
+        
+        # Strategy 5: Fuzzy word-based matching
+        query_words = re.findall(r'\b[A-Za-z][A-Za-z0-9]*\b', query)
+        for word in query_words:
+            # Look for tables that start with this word
+            matching_tables = [t for t in known_tables if t.lower().startswith(word.lower())]
+            if len(matching_tables) == 1:  # Only if unique match
+                return matching_tables[0]
         
         return None
 
@@ -1844,3 +2285,146 @@ class EnhancedRANChatbot(RANChatbot):
             return "\n".join(out)
         except Exception:
             return text
+
+    # Performance Optimization Methods
+    
+    def _run_parallel_processes_optimized(self, user_query: str, intent: str, aggregator: Dict) -> Dict:
+        """Optimized parallel processing with selective execution and caching"""
+        parallel_results = {}
+        perf = aggregator['performance']
+        
+        # Skip expensive processes if we have high-confidence explicit table match
+        explicit_table_confidence = self._check_explicit_table_confidence(user_query)
+        skip_expensive = explicit_table_confidence > 0.8
+        
+        # 1. Fast Explicit Table Extraction (always run)
+        start_time = time.time()
+        try:
+            table_result = self._process_table_extraction_optimized(user_query, intent, aggregator)
+            parallel_results['table_extraction'] = table_result
+            aggregator['processing_stats']['table_extraction'] = 'success'
+        except Exception as e:
+            parallel_results['table_extraction'] = {'error': str(e)}
+            aggregator['processing_stats']['table_extraction'] = f'error: {e}'
+        perf['process_times']['table_extraction'] = time.time() - start_time
+        
+        # 2. Domain Routing (conditional)
+        if not skip_expensive:
+            start_time = time.time()
+            try:
+                domain_result = self._process_domain_routing(user_query, intent, aggregator)
+                parallel_results['domain_routing'] = domain_result
+                aggregator['processing_stats']['domain_routing'] = 'success'
+            except Exception as e:
+                parallel_results['domain_routing'] = {'error': str(e)}
+                aggregator['processing_stats']['domain_routing'] = f'error: {e}'
+            perf['process_times']['domain_routing'] = time.time() - start_time
+        
+        # 3. Entity Extraction (with caching)
+        start_time = time.time()
+        try:
+            entity_result = self._process_entity_extraction(user_query, intent, aggregator)
+            parallel_results['entity_extraction'] = entity_result
+            aggregator['processing_stats']['entity_extraction'] = 'success'
+        except Exception as e:
+            parallel_results['entity_extraction'] = {'error': str(e)}
+            aggregator['processing_stats']['entity_extraction'] = f'error: {e}'
+        perf['process_times']['entity_extraction'] = time.time() - start_time
+        
+        # 4. Selective Advanced Processing
+        if not skip_expensive and len(aggregator['all_tables']) < 3:
+            # Only run expensive processes if we don't have enough results
+            start_time = time.time()
+            try:
+                synonym_result = self._process_synonym_expansion(user_query, intent, aggregator)
+                parallel_results['synonym_expansion'] = synonym_result
+                aggregator['processing_stats']['synonym_expansion'] = 'success'
+            except Exception as e:
+                parallel_results['synonym_expansion'] = {'error': str(e)}
+                aggregator['processing_stats']['synonym_expansion'] = f'error: {e}'
+            perf['process_times']['synonym_expansion'] = time.time() - start_time
+        
+        return parallel_results
+    
+    def _check_explicit_table_confidence(self, query: str) -> float:
+        """Quick check for explicit table mentions with high confidence"""
+        query_upper = query.strip()
+        
+        # Check for exact PascalCase matches (high confidence)
+        pascal_pattern = r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)*)\b'
+        matches = re.findall(pascal_pattern, query_upper)
+        
+        if matches:
+            # Check if any match is likely a table name
+            cached_tables = self._table_metadata_cache.get('all_tables', [])
+            for match in matches:
+                if match in cached_tables:
+                    return 0.95  # Very high confidence
+        
+        return 0.0
+    
+    def _process_table_extraction_optimized(self, user_query: str, intent: str, aggregator: Dict) -> Dict:
+        """Optimized table extraction with pre-compiled patterns and caching"""
+        results = {'tables_found': [], 'extraction_method': 'optimized'}
+        
+        # Use pre-compiled patterns
+        potential_tables = self._table_name_pattern.findall(user_query)
+        cached_tables = self._table_metadata_cache.get('all_tables', [])
+        
+        for table_candidate in potential_tables:
+            if table_candidate in cached_tables:
+                # Direct match with cached table list
+                results['tables_found'].append({
+                    'table_name': table_candidate,
+                    'confidence': 1.0,
+                    'method': 'direct_cache_match'
+                })
+                
+                # Add to aggregator with high boost
+                self._add_table_to_aggregator(
+                    table_candidate, 
+                    'explicit_table_optimized', 
+                    {'relevance_score': 15.0, 'confidence': 1.0}, 
+                    aggregator
+                )
+                
+                # Store as explicit table for ranking boost
+                aggregator['key_results']['explicit_table'] = table_candidate
+        
+        return results
+    
+    def _intelligent_fallback_search(self, aggregator: Dict) -> List[Dict]:
+        """Intelligent fallback with cached domain search"""
+        if aggregator['all_tables']:
+            return []  # No fallback needed
+        
+        try:
+            fallback_tables = set()
+            
+            # Use domain cache for quick fallback
+            query_tokens = set(aggregator.get('query_tokens', []))
+            
+            for domain in ['power', 'frequency', 'timing', 'network', 'performance']:
+                cache_key = f'domain_{domain}'
+                if cache_key in self._domain_cache:
+                    domain_tables = self._domain_cache[cache_key]
+                    
+                    # Check if query relates to this domain
+                    domain_keywords = self.query_synonyms.get(domain, [])
+                    if any(keyword in query_tokens for keyword in domain_keywords):
+                        # Add a few tables from this domain
+                        for table in list(domain_tables)[:2]:
+                            fallback_tables.add(table)
+                            self._add_table_to_aggregator(
+                                table, 
+                                f'domain_fallback_{domain}', 
+                                {'relevance_score': 2.0}, 
+                                aggregator
+                            )
+            
+            # Re-rank after fallback additions
+            return self._rank_aggregated_tables(aggregator['all_tables'], aggregator)
+            
+        except Exception as e:
+            print(f"Fallback search failed: {e}")
+            return []
