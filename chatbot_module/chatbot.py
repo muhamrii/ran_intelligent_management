@@ -1,6 +1,7 @@
 """
 Chatbot Module
 Contains all functions related to information retrieval and answer generation
+Enhanced with NLU improvements from Phases 2-4
 """
 
 import pandas as pd
@@ -17,6 +18,7 @@ import re
 import torch
 from datetime import datetime
 import os
+from .enhanced_nlu_functions import EnhancedNLUMixin
 
 class OptimizedQueryInterface:
     """Performance-optimized query interface for large KG"""
@@ -618,7 +620,7 @@ class RANQueryInterface:
                 'keywords_used': domain_keywords
             }
 
-class RANChatbot:
+class RANChatbot(EnhancedNLUMixin):
     """Main chatbot class that combines NER and Query capabilities"""
     
     def __init__(self, neo4j_integrator):

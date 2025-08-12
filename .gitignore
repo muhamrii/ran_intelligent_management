@@ -22,4 +22,5 @@ config.yaml
 
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
+script_backup
 ran_domain_model
